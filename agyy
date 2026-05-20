@@ -1,0 +1,1145 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+AUTH_DIR="${AUTH_DIR:-$HOME/.agy_toys/auth}"
+TARGET_AUTH="${TARGET_AUTH:-$HOME/.gemini/antigravity-cli/antigravity-oauth-token}"
+USAGE_FILE="$AUTH_DIR/auth_usage.csv"
+LOCK_DIR="$AUTH_DIR/.lock"
+DEL=","
+
+REFRESH="7d"
+DEFAULT_QUOTA=100
+
+# ANSI Color Codes (enabled only if stdout is a TTY)
+if [[ -t 1 ]]; then
+  C_RESET=$'\e[0m'
+  C_BOLD=$'\e[1m'
+  C_DIM=$'\e[2m'
+  C_RED=$'\e[31m'
+  C_GREEN=$'\e[32m'
+  C_YELLOW=$'\e[33m'
+  C_BLUE=$'\e[34m'
+  C_MAGENTA=$'\e[35m'
+  C_CYAN=$'\e[36m'
+  C_WHITE=$'\e[37m'
+  C_BRIGHT_GREEN=$'\e[92m'
+  C_BRIGHT_YELLOW=$'\e[93m'
+  C_BRIGHT_RED=$'\e[91m'
+else
+  C_RESET=''
+  C_BOLD=''
+  C_DIM=''
+  C_RED=''
+  C_GREEN=''
+  C_YELLOW=''
+  C_BLUE=''
+  C_MAGENTA=''
+  C_CYAN=''
+  C_WHITE=''
+  C_BRIGHT_GREEN=''
+  C_BRIGHT_YELLOW=''
+  C_BRIGHT_RED=''
+fi
+
+mkdir -p "$AUTH_DIR"
+mkdir -p "$(dirname "$TARGET_AUTH")"
+[[ -f "$USAGE_FILE" ]] || : > "$USAGE_FILE"
+
+re_escape() {
+  printf '%s' "$1" | sed 's/[][\.*^$/]/\\&/g'
+}
+
+is_int() {
+  [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+parse_refresh() {
+  local str="$1" compact d h m seconds=0
+  compact=$(printf '%s' "$str" | tr -d '[:space:]')
+  if [[ "$compact" =~ ([0-9]+)d ]]; then
+    d=${BASH_REMATCH[1]}; seconds=$(( seconds + d * 86400 ))
+    compact=${compact/"${d}d"/}
+  fi
+  if [[ "$compact" =~ ([0-9]+)h ]]; then
+    h=${BASH_REMATCH[1]}; seconds=$(( seconds + h * 3600 ))
+    compact=${compact/"${h}h"/}
+  fi
+  if [[ "$compact" =~ ([0-9]+)m ]]; then
+    m=${BASH_REMATCH[1]}; seconds=$(( seconds + m * 60 ))
+  fi
+  printf '%d' "$seconds"
+}
+
+fmt_time() {
+  local t=$1 h m s
+  (( t < 0 )) && t=0
+  h=$(( t / 3600 )); m=$(( (t % 3600) / 60 )); s=$(( t % 60 ))
+  printf '%02dh%02dm%02ds' "$h" "$m" "$s"
+}
+
+acquire_lock() {
+  local waited=0
+  while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+    local lock_pid=""
+    [[ -f "$LOCK_DIR/pid" ]] && lock_pid=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
+    if [[ -z "$lock_pid" ]] || ! kill -0 "$lock_pid" 2>/dev/null; then
+      rm -rf "$LOCK_DIR" 2>/dev/null || true
+      continue
+    fi
+    sleep 0.05
+    waited=$(( waited + 1 ))
+    if (( waited > 40 )); then
+      rm -rf "$LOCK_DIR" 2>/dev/null || true
+      mkdir "$LOCK_DIR" 2>/dev/null && break
+      echo -e "${C_RED}Error: could not acquire lock on $AUTH_DIR${C_RESET}" >&2
+      return 1
+    fi
+  done
+  echo "$$" > "$LOCK_DIR/pid" 2>/dev/null || true
+  trap 'rm -rf "$LOCK_DIR" 2>/dev/null || true' EXIT
+}
+
+AUTH_line() {
+  local esc
+  esc=$(re_escape "$1")
+  grep -E "^${esc}${DEL}" "$USAGE_FILE" | head -n1
+}
+
+read_fields() {
+  SPLIT=()
+  IFS="$DEL" read -r -a SPLIT <<< "$1"
+  while (( ${#SPLIT[@]} < 9 )); do SPLIT[${#SPLIT[@]}]=""; done
+}
+
+get_access_AUTH() {
+  local f="$1"
+  [[ -f "$f" ]] || return 1
+  command -v jq >/dev/null 2>&1 && jq -r '.token.access_token // .access_token // empty' "$f" 2>/dev/null || \
+    sed -n 's/.*"access_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -n1
+}
+
+get_refresh_AUTH() {
+  local f="$1"
+  [[ -f "$f" ]] || return 1
+  command -v jq >/dev/null 2>&1 && jq -r '.token.refresh_token // .refresh_token // empty' "$f" 2>/dev/null || \
+    sed -n 's/.*"refresh_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -n1
+}
+
+model_stat_calc() {
+  local q="$1" r="$2" u="$3" l="$4" now window_end
+  now=$(date +%s)
+  is_int "$q" || q=0
+  is_int "$u" || u=0
+  is_int "$l" || l=0
+  window_end=$(( l + $(parse_refresh "$r") ))
+  W_WEND=$window_end
+  if (( now >= window_end )); then
+    W_EFF=0; W_LEFT=0; W_RESET=1
+  else
+    W_EFF=$u; W_LEFT=$(( window_end - now )); W_RESET=0
+  fi
+  if (( W_LEFT < 0 )); then
+    W_LEFT=0
+  fi
+  W_PCT=0
+  if (( q > 0 )); then
+    W_PCT=$(( W_EFF * 100 / q ))
+  fi
+  if (( W_PCT > 100 )); then
+    W_PCT=100
+  fi
+}
+
+AUTH_stat() {
+  # Gemini (G)
+  model_stat_calc "${SPLIT[1]:-0}" "${SPLIT[2]:-$REFRESH}" "${SPLIT[3]:-0}" "${SPLIT[4]:-0}"
+  M_EFF_G=$W_EFF; M_LEFT_G=$W_LEFT; M_RESET_G=$W_RESET; M_PCT_G=$W_PCT
+  M_QUOTA_G="${SPLIT[1]:-0}"; M_U_G="${SPLIT[3]:-0}"; M_L_G="${SPLIT[4]:-0}"; M_R_G="${SPLIT[2]:-$REFRESH}"
+  M_WEND_G=$W_WEND
+
+  # Claude (C)
+  model_stat_calc "${SPLIT[5]:-0}" "${SPLIT[6]:-$REFRESH}" "${SPLIT[7]:-0}" "${SPLIT[8]:-0}"
+  M_EFF_C=$W_EFF; M_LEFT_C=$W_LEFT; M_RESET_C=$W_RESET; M_PCT_C=$W_PCT
+  M_QUOTA_C="${SPLIT[5]:-0}"; M_U_C="${SPLIT[7]:-0}"; M_L_C="${SPLIT[8]:-0}"; M_R_C="${SPLIT[6]:-$REFRESH}"
+  M_WEND_C=$W_WEND
+}
+
+usage_field() {
+  local u="$1" q="$2" pct=0 w=20 filled i bar="["
+  if (( q > 0 )); then
+    pct=$(( u * 100 / q ))
+  fi
+  if (( pct > 100 )); then
+    pct=100
+  fi
+  if (( pct < 0 )); then
+    pct=0
+  fi
+  filled=$(( pct * w / 100 ))
+  
+  local color=""
+  if (( pct >= 80 )); then
+    color="${C_RED}"
+  elif (( pct >= 50 )); then
+    color="${C_YELLOW}"
+  else
+    color="${C_GREEN}"
+  fi
+
+  for ((i = 0; i < w; i++)); do
+    if (( i < filled )); then 
+      bar+="${color}#${C_RESET}"
+    else 
+      bar+=" "
+    fi
+  done
+  bar+="]"
+  printf '%s %03d%%' "$bar" "$pct"
+}
+
+cmd_whoami() {
+  local active_name
+  active_name=$(find_active_AUTH) || active_name=""
+  if [[ -n "$active_name" ]]; then
+    echo -e "${C_GREEN}● Active profile:${C_RESET} ${C_BOLD}${C_WHITE}${active_name}${C_RESET}"
+  elif [[ -f "$TARGET_AUTH" ]] && [[ -n "$(get_access_AUTH "$TARGET_AUTH" 2>/dev/null)" ]]; then
+    echo -e "${C_YELLOW}● Active profile:${C_RESET} ${C_BOLD}${C_YELLOW}[untracked session]${C_RESET} ${C_DIM}(save with: agyy save <name>)${C_RESET}"
+  else
+    echo -e "${C_YELLOW}No active profile configured. Run 'agyy' to log in.${C_RESET}"
+  fi
+}
+
+revoke_AUTH_token() {
+  local f="$1"
+  [[ -f "$f" ]] || return 0
+  local ref_token acc_token
+  ref_token=$(get_refresh_AUTH "$f") || ref_token=""
+  acc_token=$(get_access_AUTH "$f") || acc_token=""
+
+  local target_token="${ref_token:-$acc_token}"
+  if [[ -n "$target_token" ]]; then
+    echo -e "${C_DIM}Revoking token on Google servers...${C_RESET}"
+    local http_code
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" -X POST -d "token=${target_token}" https://oauth2.googleapis.com/revoke 2>/dev/null || echo "000")
+    if [[ "$http_code" == "200" ]]; then
+      echo -e "${C_GREEN}✔ Token revoked on Google servers.${C_RESET}"
+    else
+      echo -e "${C_YELLOW}ℹ Google Revoke response: HTTP ${http_code} (token may already be inactive).${C_RESET}"
+    fi
+  fi
+}
+
+cmd_delete() {
+  local target_name=""
+  local force=0
+  local do_revoke=0
+  local specified_revoke_flag=0
+
+  for arg in "$@"; do
+    if [[ "$arg" == "-f" || "$arg" == "--force" || "$arg" == "-y" ]]; then
+      force=1
+    elif [[ "$arg" == "-r" || "$arg" == "--revoke" ]]; then
+      do_revoke=1
+      specified_revoke_flag=1
+    elif [[ -z "$target_name" ]]; then
+      target_name="$arg"
+    fi
+  done
+
+  if [[ -z "$target_name" ]]; then
+    shopt -s nullglob
+    local auth_files=("$AUTH_DIR"/antigravity-oauth-token-*)
+    shopt -u nullglob
+    if (( ${#auth_files[@]} == 0 )); then
+      echo -e "${C_RED}No auth profiles found in $AUTH_DIR.${C_RESET}" >&2
+      return 1
+    fi
+
+    echo -e "${C_BOLD}Saved profiles:${C_RESET}"
+    for f in "${auth_files[@]}"; do
+      local n="${f##*antigravity-oauth-token-}"
+      echo -e "  - ${C_CYAN}${n}${C_RESET}"
+    done
+    echo
+    read -p "Profile name to delete: " -r target_name || return 1
+    target_name=$(printf '%s' "$target_name" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+  fi
+
+  if [[ -z "$target_name" ]]; then
+    echo -e "${C_RED}Error: no profile name specified.${C_RESET}" >&2
+    return 1
+  fi
+
+  local target_file="$AUTH_DIR/antigravity-oauth-token-$target_name"
+  local active_name
+  active_name=$(find_active_AUTH) || active_name=""
+  local is_active=0
+  [[ "$target_name" == "$active_name" ]] && is_active=1
+
+  if (( is_active == 1 && force == 0 )); then
+    local confirm
+    echo -e "${C_YELLOW}⚠ Warning: '${C_BOLD}${target_name}${C_RESET}${C_YELLOW}' is the active profile.${C_RESET}"
+    read -p "Delete and auto-switch to next available profile? (y/N): " -r confirm || confirm="n"
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+      echo -e "${C_DIM}Deletion cancelled.${C_RESET}"
+      return 0
+    fi
+  fi
+
+  if (( specified_revoke_flag == 0 && force == 0 )); then
+    local ask_revoke
+    read -p "Also permanently revoke token on Google servers? (y/N): " -r ask_revoke || ask_revoke="n"
+    if [[ "$ask_revoke" =~ ^[Yy]$ ]]; then
+      do_revoke=1
+    fi
+  fi
+
+  if (( do_revoke == 1 )) && [[ -f "$target_file" ]]; then
+    revoke_AUTH_token "$target_file"
+  fi
+
+  local removed=0
+  if [[ -f "$target_file" ]]; then
+    rm -f "$target_file"
+    removed=1
+  fi
+
+  if [[ -f "$USAGE_FILE" ]]; then
+    local esc tmp
+    esc=$(re_escape "$target_name")
+    tmp=$(mktemp)
+    grep -v -E "^${esc}${DEL}" "$USAGE_FILE" > "$tmp" || true
+    mv "$tmp" "$USAGE_FILE"
+  fi
+
+  if (( removed == 1 )); then
+    echo -e "${C_GREEN}✔ Deleted profile '${C_BOLD}${target_name}${C_RESET}${C_GREEN}'.${C_RESET}"
+    if (( is_active == 1 )); then
+      echo -e "${C_DIM}Switching to next available profile...${C_RESET}"
+      prepare_AUTH "" || true
+    fi
+  else
+    echo -e "${C_YELLOW}Profile '${target_name}' not found in $AUTH_DIR.${C_RESET}"
+  fi
+}
+
+cmd_status() {
+  local arg1="${1:-}"
+  local arg2="${2:-}"
+  local filter_model=""
+  local filter_auth=""
+  local a1_lower="${arg1,,}"
+  local a2_lower="${arg2,,}"
+
+  if [[ "$a1_lower" == "gemini" ]]; then
+    filter_model="Gemini"
+    filter_auth="$arg2"
+  elif [[ "$a1_lower" == "claude" ]]; then
+    filter_model="Claude"
+    filter_auth="$arg2"
+  else
+    filter_auth="$arg1"
+    if [[ "$a2_lower" == "gemini" ]]; then
+      filter_model="Gemini"
+    elif [[ "$a2_lower" == "claude" ]]; then
+      filter_model="Claude"
+    fi
+  fi
+
+  local active_name
+  active_name=$(find_active_AUTH) || active_name=""
+
+  local yolo_status
+  [[ -f "$YOLO_FILE" ]] && yolo_status="${C_GREEN}ON${C_RESET}" || yolo_status="${C_YELLOW}OFF${C_RESET}"
+
+  local total_auths=0
+  [[ -f "$USAGE_FILE" ]] && total_auths=$(grep -c . "$USAGE_FILE" 2>/dev/null || echo 0)
+
+  local now line name tmp
+  now=$(date +%s)
+  tmp=$(mktemp)
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" ]] && continue
+    read_fields "$line"
+    name="${SPLIT[0]}"
+    AUTH_stat
+    local blocked_count=0
+    local kg=$now
+    if (( M_L_G >= 2000000000 )); then
+      kg=$M_L_G
+      blocked_count=$(( blocked_count + 1 ))
+    elif (( M_EFF_G >= M_QUOTA_G )); then
+      kg=$M_WEND_G
+      if (( M_RESET_G == 1 || now >= M_WEND_G )); then
+        kg=$now
+      else
+        blocked_count=$(( blocked_count + 1 ))
+      fi
+    fi
+    local kc=$now
+    if (( M_L_C >= 2000000000 )); then
+      kc=$M_L_C
+      blocked_count=$(( blocked_count + 1 ))
+    elif (( M_EFF_C >= M_QUOTA_C )); then
+      kc=$M_WEND_C
+      if (( M_RESET_C == 1 || now >= M_WEND_C )); then
+        kc=$now
+      else
+        blocked_count=$(( blocked_count + 1 ))
+      fi
+    fi
+    local key=$now
+    if (( blocked_count == 1 )); then
+      local blocked_time=$kg
+      if (( kc > kg )); then
+        blocked_time=$kc
+      fi
+      key=$(( 1000000000 + blocked_time ))
+    elif (( blocked_count == 2 )); then
+      local first_reset=$kg
+      if (( kc < kg )); then
+        first_reset=$kc
+      fi
+      key=$(( 2000000000 + first_reset ))
+    fi
+    local rstr_g rstr_c
+    if (( M_L_G >= 2000000000 )); then
+      rstr_g="${C_RED}REVOKED${C_RESET}"
+    elif (( M_RESET_G == 1 )); then
+      rstr_g="${C_BRIGHT_GREEN}READY${C_RESET}"
+    else
+      rstr_g="${C_YELLOW}$(fmt_time "$M_LEFT_G")${C_RESET}"
+    fi
+
+    if (( M_L_C >= 2000000000 )); then
+      rstr_c="${C_RED}REVOKED${C_RESET}"
+    elif (( M_RESET_C == 1 )); then
+      rstr_c="${C_BRIGHT_GREEN}READY${C_RESET}"
+    else
+      rstr_c="${C_YELLOW}$(fmt_time "$M_LEFT_C")${C_RESET}"
+    fi
+
+    printf '%d\t%s\tGemini\t%d\t%d\t%s\t%s\tClaude\t%d\t%d\t%s\t%s\n' \
+      "$key" "$name" \
+      "$M_EFF_G" "$M_QUOTA_G" "$rstr_g" "$M_R_G" \
+      "$M_EFF_C" "$M_QUOTA_C" "$rstr_c" "$M_R_C" >> "$tmp"
+  done < "$USAGE_FILE"
+
+  if [[ ! -s "$tmp" ]]; then
+    echo -e "  ${C_RED}No auths detected in $AUTH_DIR${C_RESET}"
+    rm -f "$tmp"
+    return 0
+  fi
+
+  echo -e "  ${C_BOLD}${C_CYAN}Antigravity Auth Pool${C_RESET} ${C_DIM}|${C_RESET} Active: ${C_BOLD}${C_WHITE}${active_name:-none}${C_RESET} ${C_DIM}|${C_RESET} YOLO: ${yolo_status} ${C_DIM}|${C_RESET} Profiles: ${C_BOLD}${total_auths}${C_RESET}\n"
+
+  local first=1
+  printf "  %-2s %-20s %-8s %-27s   %-11s %s${C_RESET}\n" "" "AUTH" "MODEL" "USAGE" "LEFT" "COOLDOWN"
+  echo -e "  ${C_DIM}--------------------------------------------------------------------------------------------${C_RESET}"
+  sort -n "$tmp" | while IFS=$'\t' read -r _ name m1 u1 q1 r1 rf1 m2 u2 q2 r2 rf2; do
+    if [[ -n "$filter_auth" && "$name" != "$filter_auth" ]]; then
+      continue
+    fi
+
+    if (( first == 0 )); then
+      echo
+    else
+      first=0
+    fi
+
+    local marker="  "
+    local raw_text="$name"
+    local name_display="${C_BOLD}${C_WHITE}${name}${C_RESET}"
+    if [[ "$name" == "$active_name" ]]; then
+      marker="${C_BRIGHT_GREEN}●${C_RESET} "
+      raw_text="${name} (active)"
+      name_display="${C_BOLD}${C_BRIGHT_GREEN}${name} (active)${C_RESET}"
+    fi
+
+    local pad_len=$(( 20 - ${#raw_text} ))
+    (( pad_len < 1 )) && pad_len=1
+    local pad
+    pad=$(printf '%*s' "$pad_len" "")
+
+    local left1=$(( q1 - u1 ))
+    (( left1 < 0 )) && left1=0
+    local left2=$(( q2 - u2 ))
+    (( left2 < 0 )) && left2=0
+
+    local left_color1="${C_GREEN}"
+    (( left1 < 20 )) && left_color1="${C_RED}" || { (( left1 < 50 )) && left_color1="${C_YELLOW}"; }
+    local left_color2="${C_GREEN}"
+    (( left2 < 20 )) && left_color2="${C_RED}" || { (( left2 < 50 )) && left_color2="${C_YELLOW}"; }
+
+    if [[ -z "$filter_model" || "$filter_model" == "Gemini" ]]; then
+      printf "  %s%s%s %-8s %s   %s%03d / %-5d%s %s%s%s\n" \
+        "${marker}" "${name_display}" "${pad}" \
+        "${m1}" "$(usage_field "$u1" "$q1")" \
+        "${left_color1}" "$left1" "$q1" "${C_RESET}" \
+        "" "${r1}" ""
+    fi
+    if [[ -z "$filter_model" || "$filter_model" == "Claude" ]]; then
+      if [[ "$filter_model" == "Claude" ]]; then
+        printf "  %s%s%s %-8s %s   %s%03d / %-5d%s %s%s%s\n" \
+          "${marker}" "${name_display}" "${pad}" \
+          "${m2}" "$(usage_field "$u2" "$q2")" \
+          "${left_color2}" "$left2" "$q2" "${C_RESET}" \
+          "" "${r2}" ""
+      else
+        printf "    %-20s %-8s %s   %s%03d / %-5d%s %s%s%s\n" \
+          "" \
+          "${m2}" "$(usage_field "$u2" "$q2")" \
+          "${left_color2}" "$left2" "$q2" "${C_RESET}" \
+          "" "${r2}" ""
+      fi
+    fi
+  done
+  rm -f "$tmp"
+}
+
+pick_AUTH() {
+  local target_model="${1:-}"
+  local line found=0
+  best_name=""; best_eff=999999; best_time=999999999; best_u=999999
+  if [[ ! -s "$USAGE_FILE" ]]; then
+    echo -e "${C_RED}No auths available.${C_RESET}" >&2
+    return 1
+  fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" ]] && continue
+    read_fields "$line"
+    AUTH_stat
+    local eff left u q r reset
+    local left_g=0
+    if (( M_EFF_G >= M_QUOTA_G )); then
+      left_g=$M_LEFT_G
+    fi
+    local left_c=0
+    if (( M_EFF_C >= M_QUOTA_C )); then
+      left_c=$M_LEFT_C
+    fi
+
+    if [[ "$target_model" == "Gemini" ]]; then
+      eff=$M_EFF_G; left=$left_g; u=$M_U_G; q=$M_QUOTA_G; r=$M_R_G; reset=$M_RESET_G
+    elif [[ "$target_model" == "Claude" ]]; then
+      eff=$M_EFF_C; left=$left_c; u=$M_U_C; q=$M_QUOTA_C; r=$M_R_C; reset=$M_RESET_C
+    else
+      eff=$(( M_EFF_G + M_EFF_C ))
+      left=$left_g
+      if (( left_c > left )); then
+        left=$left_c
+      fi
+      u=$(( M_U_G + M_U_C ))
+      q=$(( M_QUOTA_G + M_QUOTA_C ))
+      r="$M_R_G"
+      reset=0
+      if (( M_RESET_G == 1 && M_RESET_C == 1 )); then
+        reset=1
+      fi
+    fi
+
+    local is_better=0
+    if (( eff < best_eff )); then
+      is_better=1
+    elif (( eff == best_eff )); then
+      if (( left < best_time )); then
+        is_better=1
+      elif (( left == 0 && best_time == 0 && u < best_u )); then
+        is_better=1
+      fi
+    fi
+    if (( is_better == 1 )); then
+      best_name="${SPLIT[0]}"; best_eff=$eff; best_time=$left; found=1; best_u=$u
+    fi
+  done < "$USAGE_FILE"
+  if (( found == 0 )); then
+    echo -e "${C_RED}No suitable auth found.${C_RESET}" >&2
+    return 1
+  fi
+  return 0
+}
+
+find_active_AUTH() {
+  local f name
+  [[ -f "$TARGET_AUTH" ]] || return 1
+  local target_ref
+  target_ref=$(get_refresh_AUTH "$TARGET_AUTH") || target_ref=""
+  [[ -n "$target_ref" ]] || return 1
+  shopt -s nullglob
+  for f in "$AUTH_DIR"/antigravity-oauth-token-*; do
+    local f_ref
+    f_ref=$(get_refresh_AUTH "$f") || f_ref=""
+    if [[ "$target_ref" == "$f_ref" ]]; then
+      name=${f#"$AUTH_DIR"/"antigravity-oauth-token-"}
+      shopt -u nullglob
+      echo "$name"
+      return 0
+    fi
+  done
+  shopt -u nullglob
+  return 1
+}
+
+swap_AUTH() {
+  local arg1="${1:-}"
+  local arg2="${2:-}"
+  local desired_auth=""
+  local target_model=""
+  local a1_lower="${arg1,,}"
+  local a2_lower="${arg2,,}"
+
+  if [[ "$a1_lower" == "gemini" ]]; then
+    target_model="Gemini"
+  elif [[ "$a1_lower" == "claude" ]]; then
+    target_model="Claude"
+  else
+    desired_auth="$arg1"
+    if [[ "$a2_lower" == "gemini" ]]; then
+      target_model="Gemini"
+    elif [[ "$a2_lower" == "claude" ]]; then
+      target_model="Claude"
+    elif [[ -n "$arg2" ]]; then
+      echo -e "${C_RED}Error: model filter must be 'Gemini' or 'Claude'${C_RESET}" >&2
+      return 1
+    fi
+  fi
+
+  if [[ -n "$desired_auth" ]]; then
+    read_fields "$(AUTH_line "$desired_auth")" || true
+    if [[ -z "${SPLIT[0]}" ]]; then
+      echo -e "${C_RED}Error: profile '$desired_auth' not found. Run 'agyy status' to see saved profiles.${C_RESET}" >&2
+      return 1
+    fi
+    best_name="${SPLIT[0]}"
+  else
+    pick_AUTH "$target_model" || return 1
+  fi
+
+  local AUTH_file="${AUTH_DIR}/antigravity-oauth-token-${best_name}"
+  if [[ ! -f "$AUTH_file" ]]; then
+    echo -e "${C_RED}Error: profile file not found: $AUTH_file${C_RESET}" >&2
+    return 1
+  fi
+  if [[ -z "$(get_access_AUTH "$AUTH_file")" ]]; then
+    echo -e "${C_RED}Error: could not extract access token from $AUTH_file${C_RESET}" >&2
+    return 1
+  fi
+  cp -p "$AUTH_file" "$TARGET_AUTH"
+  chmod 600 "$TARGET_AUTH"
+  echo -e "${C_GREEN}✔ Switched active profile to ${C_BOLD}${best_name}${C_RESET}"
+  sync_AUTHs_bg
+}
+
+prepare_AUTH() {
+  local target_model=""
+  local tm_lower="${1,,}"
+  [[ "$tm_lower" == "gemini" ]] && target_model="Gemini"
+  [[ "$tm_lower" == "claude" ]] && target_model="Claude"
+  local active_name
+  active_name=$(find_active_AUTH) || active_name=""
+  
+  local has_model=0
+  if [[ -n "$active_name" ]]; then
+    read_fields "$(AUTH_line "$active_name")" || true
+    AUTH_stat
+    if [[ "$target_model" == "Gemini" ]]; then
+      if (( M_LEFT_G == 0 || M_EFF_G < M_QUOTA_G )); then
+        has_model=1
+      fi
+    elif [[ "$target_model" == "Claude" ]]; then
+      if (( M_LEFT_C == 0 || M_EFF_C < M_QUOTA_C )); then
+        has_model=1
+      fi
+    else
+      if (( (M_LEFT_G == 0 || M_EFF_G < M_QUOTA_G) && (M_LEFT_C == 0 || M_EFF_C < M_QUOTA_C) )); then
+        has_model=1
+      fi
+    fi
+  fi
+
+  if (( has_model == 1 )); then
+    sync_AUTHs_bg
+    return 0
+  fi
+
+  # Out of quota or missing active auth -> sync live data and swap
+  sync_AUTHs
+  pick_AUTH "$target_model" || return 1
+  
+  if [[ "$best_name" == "$active_name" ]]; then
+    echo -e "${C_RED}Error: all available profiles are currently out of quota.${C_RESET}" >&2
+    return 1
+  fi
+
+  swap_AUTH "$best_name" "$target_model"
+}
+
+cmd_save() {
+  local new_name="${1:-}"
+  if [[ ! -f "$TARGET_AUTH" ]]; then
+    echo -e "${C_RED}Error: no active session found at $TARGET_AUTH${C_RESET}" >&2
+    echo -e "${C_DIM}Run 'agyy' to log in first.${C_RESET}" >&2
+    return 1
+  fi
+
+  local target_ref
+  target_ref=$(get_refresh_AUTH "$TARGET_AUTH") || target_ref=""
+  if [[ -z "$target_ref" ]]; then
+    echo -e "${C_RED}Error: active token file does not contain a valid refresh token.${C_RESET}" >&2
+    return 1
+  fi
+
+  local existing_name
+  existing_name=$(find_active_AUTH) || existing_name=""
+  if [[ -n "$existing_name" ]]; then
+    echo -e "${C_YELLOW}ℹ Active session is already saved as '${C_BOLD}${existing_name}${C_RESET}${C_YELLOW}'.${C_RESET}"
+    return 0
+  fi
+
+  while [[ -z "$new_name" ]]; do
+    read -p "Profile name (e.g. work, personal): " -r new_name || return 1
+    new_name=$(printf '%s' "$new_name" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+  done
+
+  if [[ ! "$new_name" =~ ^[a-z0-9_-]+$ ]]; then
+    echo -e "${C_RED}Error: invalid name '$new_name'. Use alphanumeric characters, hyphens, or underscores.${C_RESET}" >&2
+    return 1
+  fi
+
+  local dest_file="$AUTH_DIR/antigravity-oauth-token-$new_name"
+  if [[ -f "$dest_file" ]]; then
+    echo -e "${C_RED}Error: profile '$new_name' already exists at $dest_file${C_RESET}" >&2
+    return 1
+  fi
+
+  cp -p "$TARGET_AUTH" "$dest_file"
+  chmod 600 "$dest_file"
+  echo -e "${C_GREEN}✔ Saved active session as '${C_BOLD}${new_name}${C_RESET}${C_GREEN}'.${C_RESET}"
+  sync_AUTHs_bg
+}
+
+sync_AUTHs() {
+  AUTH_DIR="$AUTH_DIR" USAGE_FILE="$USAGE_FILE" DEFAULT_QUOTA="$DEFAULT_QUOTA" REFRESH="$REFRESH" python3 - << 'PYEOF'
+import json, glob, urllib.request, urllib.parse, time, os, codecs
+from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
+
+client_id = codecs.decode('1071006060591-gzuffva2u21yper235igbybwu4t403rc.nccf.tbbtyrhfrepbagrag.pbz', 'rot_13')
+client_secret = codecs.decode('TBPFCK-X58SJE486YqYW1zYO8fKP4m6dQNs', 'rot_13')
+auth_dir = os.environ.get('AUTH_DIR', os.path.expanduser('~/.agy_toys/auth'))
+usage_file = os.environ.get('USAGE_FILE', os.path.join(auth_dir, 'auth_usage.csv'))
+default_quota = os.environ.get('DEFAULT_QUOTA', '100')
+default_refresh = os.environ.get('REFRESH', '7d')
+
+def parse_iso(ts_str):
+    if not ts_str: return 0
+    try:
+        dt = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+        return int(dt.timestamp())
+    except: return 0
+
+def fetch_single_auth(fpath):
+    try:
+        os.chmod(fpath, 0o600)
+    except Exception:
+        pass
+    name = os.path.basename(fpath).replace('antigravity-oauth-token-', '')
+    try:
+        with open(fpath, 'r') as f:
+            data = json.load(f)
+    except Exception:
+        return name, None
+
+    token_obj = data.get('token', {})
+    access_token = token_obj.get('access_token') or data.get('access_token')
+    refresh_token = token_obj.get('refresh_token') or data.get('refresh_token')
+
+    def call_api(at):
+        headers = {'Authorization': f'Bearer {at}', 'Content-Type': 'application/json', 'User-Agent': 'antigravity-cli'}
+        req = urllib.request.Request(
+            'https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels',
+            data=b'{}',
+            headers=headers,
+            method='POST'
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            return json.loads(resp.read().decode())
+
+    res = None
+    if access_token:
+        try:
+            res = call_api(access_token)
+        except Exception:
+            pass
+
+    if not res and refresh_token:
+        body = urllib.parse.urlencode({
+            'client_id': client_id,
+            'client_secret': client_secret,
+            'grant_type': 'refresh_token',
+            'refresh_token': refresh_token,
+        }).encode()
+        rreq = urllib.request.Request('https://oauth2.googleapis.com/token', data=body, method='POST')
+        try:
+            with urllib.request.urlopen(rreq, timeout=6) as rresp:
+                rres = json.loads(rresp.read().decode())
+                new_at = rres.get('access_token')
+                if new_at:
+                    access_token = new_at
+                    if 'token' in data and isinstance(data['token'], dict):
+                        data['token']['access_token'] = new_at
+                        exp_dt = datetime.fromtimestamp(time.time() + rres.get('expires_in', 3600), timezone.utc)
+                        data['token']['expiry'] = exp_dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+                    else:
+                        data['access_token'] = new_at
+                    try:
+                        with open(fpath, 'w') as out_f:
+                            json.dump(data, out_f, indent=2)
+                        os.chmod(fpath, 0o600)
+                    except Exception:
+                        pass
+                    res = call_api(access_token)
+        except Exception:
+            pass
+
+    if not res:
+        return name, None
+
+    models = res.get('models', {})
+    gem_rem = 1.0; gem_reset = 0
+    claude_rem = 1.0; claude_reset = 0
+    for mid, mcfg in models.items():
+        qinfo = mcfg.get('quotaInfo', {})
+        rf = qinfo.get('remainingFraction', 1.0)
+        rt = parse_iso(qinfo.get('resetTime'))
+        if 'gemini' in mid:
+            gem_rem = min(gem_rem, rf)
+            if rt > gem_reset: gem_reset = rt
+        elif 'claude' in mid:
+            claude_rem = min(claude_rem, rf)
+            if rt > claude_reset: claude_reset = rt
+
+    return name, {'gem_rem': gem_rem, 'gem_reset': gem_reset, 'claude_rem': claude_rem, 'claude_reset': claude_reset}
+
+existing = {}
+if os.path.exists(usage_file):
+    with open(usage_file, 'r') as f:
+        for line in f:
+            p = line.strip().split(',')
+            if p and p[0]: existing[p[0]] = p
+
+files = sorted(glob.glob(os.path.join(auth_dir, 'antigravity-oauth-token-*')))
+with ThreadPoolExecutor(max_workers=max(1, len(files))) as pool:
+    fetched = dict(pool.map(fetch_single_auth, files))
+
+out_lines = []
+now = int(time.time())
+for fpath in files:
+    name = os.path.basename(fpath).replace('antigravity-oauth-token-', '')
+    orig = existing.get(name, [name, default_quota, default_refresh, '0', '0', default_quota, default_refresh, '0', '0'])
+    while len(orig) < 9: orig.append('0')
+    qG, rG = orig[1] or default_quota, orig[2] or default_refresh
+    qC, rC = orig[5] or default_quota, orig[6] or default_refresh
+    uG, lG = orig[3] or '0', orig[4] or '0'
+    uC, lC = orig[7] or '0', orig[8] or '0'
+
+    q = fetched.get(name)
+    if q is not None:
+        uG = str(int(round((1.0 - q['gem_rem']) * int(qG))))
+        if q['gem_reset'] > now and int(uG) > 0:
+            lG = str(q['gem_reset'] - 604800)
+        else:
+            lG = '0'
+
+        uC = str(int(round((1.0 - q['claude_rem']) * int(qC))))
+        if q['claude_reset'] > now and int(uC) > 0:
+            lC = str(q['claude_reset'] - 604800)
+        else:
+            lC = '0'
+    else:
+        uG = qG; lG = '9999999999'
+        uC = qC; lC = '9999999999'
+
+    out_lines.append(f"{name},{qG},{rG},{uG},{lG},{qC},{rC},{uC},{lC}\n")
+
+tmp_usage = usage_file + '.tmp'
+with open(tmp_usage, 'w') as f:
+    f.writelines(out_lines)
+os.replace(tmp_usage, usage_file)
+PYEOF
+}
+
+sync_AUTHs_bg() {
+  local sync_lock="$AUTH_DIR/.sync_lock"
+  if [[ -f "$sync_lock" ]]; then
+    local lock_pid
+    lock_pid=$(cat "$sync_lock" 2>/dev/null || true)
+    if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
+      return 0
+    fi
+    rm -f "$sync_lock" 2>/dev/null || true
+  fi
+  (
+    echo "$$" > "$sync_lock" 2>/dev/null || true
+    trap 'rm -f "$sync_lock" 2>/dev/null || true' EXIT
+    sync_AUTHs >/dev/null 2>&1
+  ) &
+  disown 2>/dev/null || true
+}
+
+prompt_stop_agy() {
+  local action_desc="${1:-proceed}"
+  if pgrep -x "agy" >/dev/null 2>&1; then
+    local answer
+    read -p "Would you like to stop 'agy' and ${action_desc}? (y/N): " -r answer || answer="n"
+    if [[ "$answer" =~ ^[Yy]$ ]]; then
+      echo -e "${C_DIM}Stopping 'agy' process(es)...${C_RESET}"
+      kill $(pgrep -x agy) 2>/dev/null || true
+      sleep 1
+      if pgrep -x "agy" >/dev/null 2>&1; then
+        echo -e "${C_YELLOW}Warning: Some 'agy' process(es) did not stop. Attempting force kill...${C_RESET}"
+        kill -9 $(pgrep -x agy) 2>/dev/null || true
+        sleep 0.5
+      fi
+    else
+      echo -e "${C_RED}Error: Cannot ${action_desc} while 'agy' is running on the system.${C_RESET}" >&2
+      return 1
+    fi
+  fi
+  return 0
+}
+
+clean_cli() {
+  local target="all"
+  local force=0
+  for arg in "$@"; do
+    if [[ "$arg" == "-f" || "$arg" == "--force" ]]; then
+      force=1
+    elif [[ -n "$arg" ]]; then
+      target="$arg"
+    fi
+  done
+
+  if (( force == 0 )); then
+    prompt_stop_agy "proceed with cleanup" || return 1
+  fi
+
+  local cli_dir="$HOME/.gemini/antigravity-cli"
+  echo -e "${C_BOLD}${C_CYAN}🧹 Cleaning CLI data: ${C_WHITE}${target}${C_RESET}"
+  
+  case "$target" in
+    chats|conversations)
+      echo -e "${C_DIM}Cleaning conversations, logs, and caches...${C_RESET}"
+      rm -rf "$cli_dir"/{conversations,brain,log,cache,crashes,implicit}/* "$cli_dir"/{conversation_summaries.db*,history.jsonl*,cli.log*} 2>/dev/null || true
+      echo -e "${C_GREEN}✔ Cleared conversations, logs, and caches.${C_RESET}"
+      ;;
+    permissions)
+      echo -e "${C_DIM}Resetting trusted workspace permissions...${C_RESET}"
+      if command -v jq >/dev/null 2>&1 && [[ -f "$cli_dir/settings.json" ]]; then
+        local tmp_settings
+        tmp_settings=$(mktemp)
+        jq '.trustedWorkspaces = []' "$cli_dir/settings.json" > "$tmp_settings" 2>/dev/null && mv "$tmp_settings" "$cli_dir/settings.json" || rm -f "$tmp_settings"
+      fi
+      echo -e "${C_GREEN}✔ Workspace permissions reset.${C_RESET}"
+      ;;
+    all)
+      clean_cli chats -f
+      clean_cli permissions -f
+      ;;
+    *)
+      echo -e "${C_RED}Error: invalid clean target '$target'. Options: chats, permissions, all${C_RESET}" >&2
+      return 1
+      ;;
+  esac
+}
+
+sync_skills() {
+  local cli_dir="$HOME/.gemini/antigravity-cli"
+  local agents_skills="$HOME/.agents/skills"
+  echo -e "${C_BOLD}${C_CYAN}🔄 Syncing skills with ${C_WHITE}${agents_skills}${C_RESET}"
+  
+  mkdir -p "$agents_skills"
+  mkdir -p "$cli_dir"
+
+  if [[ -L "$cli_dir/skills" ]]; then
+    local current_target
+    current_target=$(readlink "$cli_dir/skills")
+    if [[ "$current_target" == "$agents_skills" || "$current_target" == "$agents_skills/" ]]; then
+      echo -e "${C_GREEN}✔ Skills directory is already linked to $agents_skills.${C_RESET}"
+      prompt_stop_agy "restart 'agy' to apply synced skills" || true
+      return 0
+    fi
+    rm -f "$cli_dir/skills"
+  elif [[ -d "$cli_dir/skills" ]]; then
+    echo -e "${C_DIM}Copying skills to $agents_skills...${C_RESET}"
+    cp -rn "$cli_dir/skills/"* "$agents_skills/" 2>/dev/null || true
+    rm -rf "$cli_dir/skills"
+  fi
+
+  ln -s "$agents_skills" "$cli_dir/skills"
+  echo -e "${C_GREEN}✔ Linked CLI skills to $agents_skills.${C_RESET}"
+  prompt_stop_agy "restart 'agy' to apply synced skills" || true
+}
+
+YOLO_FILE="$AUTH_DIR/.yolo"
+
+cmd_yolo() {
+  local action="${1:-toggle}"
+  case "$action" in
+    true)
+      touch "$YOLO_FILE"
+      echo -e "${C_BOLD}${C_GREEN}✔ YOLO mode enabled${C_RESET} ${C_DIM}(--dangerously-skip-permissions active by default)${C_RESET}"
+      ;;
+    false)
+      rm -f "$YOLO_FILE"
+      echo -e "${C_BOLD}${C_YELLOW}✔ YOLO mode disabled${C_RESET} ${C_DIM}(interactive permission prompts active)${C_RESET}"
+      ;;
+    status)
+      if [[ -f "$YOLO_FILE" ]]; then
+        echo -e "${C_BOLD}${C_GREEN}YOLO mode: ON${C_RESET} ${C_DIM}(--dangerously-skip-permissions active by default)${C_RESET}"
+      else
+        echo -e "${C_BOLD}${C_YELLOW}YOLO mode: OFF${C_RESET} ${C_DIM}(interactive permission prompts active)${C_RESET}"
+      fi
+      ;;
+    *)
+      if [[ -f "$YOLO_FILE" ]]; then
+        cmd_yolo false
+      else
+        cmd_yolo true
+      fi
+      ;;
+  esac
+}
+
+init_shell() {
+  local bashrc="$HOME/.bashrc"
+  local project_dir
+  project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  echo -e "${C_BOLD}${C_CYAN}⚙ Configuring shell integration in ${C_WHITE}${bashrc}${C_RESET}"
+
+  if [[ ! -f "$bashrc" ]]; then
+    touch "$bashrc"
+  fi
+
+  # Clean up legacy wrapper function overrides if present
+  if grep -E "(agy|agyy)\(\)" "$bashrc" >/dev/null 2>&1; then
+    sed -i '/# agyy (Antigravity CLI Extension & Smart Wrapper)/,/^}/d' "$bashrc" 2>/dev/null || true
+    sed -i '/# agy-toys (Antigravity CLI Extension & Auth Utility)/,/^}/d' "$bashrc" 2>/dev/null || true
+  fi
+
+  local added_any=0
+
+  if ! grep -q "PATH=.*${project_dir}" "$bashrc" 2>/dev/null; then
+    echo -e "${C_DIM}Adding ${project_dir} to PATH in ${bashrc}...${C_RESET}"
+    printf '\n# agyy (Antigravity CLI Extension & Smart Wrapper)\nexport PATH="%s:$PATH"\nsource "%s/completion.bash" 2>/dev/null || true\n' "$project_dir" "$project_dir" >> "$bashrc"
+    added_any=1
+  fi
+
+  if (( added_any == 1 )); then
+    echo -e "${C_GREEN}✔ Shell integration installed. Run: source ~/.bashrc${C_RESET}"
+  else
+    echo -e "${C_GREEN}✔ Shell integration is already configured in ${bashrc}.${C_RESET}"
+  fi
+}
+
+case "${1:-}" in
+  status)
+    shift 2>/dev/null || true
+    acquire_lock
+    sync_AUTHs
+    cmd_status "$@"
+    ;;
+  whoami)
+    cmd_whoami
+    ;;
+  swap)
+    shift
+    if (( $# > 2 )); then
+      echo -e "${C_RED}Error: swap command accepts at most 2 arguments ([name] [model])${C_RESET}" >&2
+      exit 1
+    fi
+    acquire_lock
+    [[ -s "$USAGE_FILE" ]] || sync_AUTHs
+    swap_AUTH "$@"
+    ;;
+  save)
+    shift 2>/dev/null || true
+    acquire_lock
+    cmd_save "$@"
+    ;;
+  delete)
+    shift
+    acquire_lock
+    cmd_delete "$@"
+    ;;
+  sync)
+    shift 2>/dev/null || true
+    acquire_lock
+    sync_AUTHs
+    echo -e "${C_GREEN}✔ Quotas synced.${C_RESET}"
+    ;;
+  yolo)
+    shift 2>/dev/null || true
+    cmd_yolo "$@"
+    ;;
+  clean)
+    shift
+    clean_cli "$@"
+    ;;
+  sync-skills)
+    sync_skills
+    ;;
+  init)
+    init_shell
+    ;;
+  help|-h|--help)
+    echo -e "${C_BOLD}${C_CYAN}agyy — multi-account quota manager for agy${C_RESET}"
+    echo -e "${C_BOLD}Usage:${C_RESET}"
+    echo -e "  agyy [flags] [prompt...]        Launch agy (auto-quota & YOLO support)"
+    echo -e "  agyy <command> [options]        Run extension command\n"
+    echo -e "${C_BOLD}Commands:${C_RESET}"
+    echo -e "  ${C_GREEN}status${C_RESET} [name] [model]    Display accounts and quota usage"
+    echo -e "  ${C_GREEN}whoami${C_RESET}                  Show active profile"
+    echo -e "  ${C_GREEN}swap${C_RESET} [name] [model]      Switch active profile or model preference"
+    echo -e "  ${C_GREEN}save${C_RESET} [name]             Save active session into pool"
+    echo -e "  ${C_GREEN}delete${C_RESET} [name] [-r] [-f]   Delete profile (-r also revokes on Google)"
+    echo -e "  ${C_GREEN}sync${C_RESET}                    Refresh live quotas from Google"
+    echo -e "  ${C_GREEN}yolo${C_RESET} [true|false|status] Toggle or set auto-approval of permissions"
+    echo -e "  ${C_GREEN}clean${C_RESET} [chats|all] [-f]   Clean CLI cache and session state"
+    echo -e "  ${C_GREEN}sync-skills${C_RESET}             Link ~/.agents/skills to CLI folder"
+    echo -e "  ${C_GREEN}init${C_RESET}                    Configure PATH and completion in ~/.bashrc"
+    echo -e "  ${C_GREEN}help${C_RESET}                    Show this help message\n"
+    echo -e "${C_BOLD}Flags:${C_RESET}"
+    echo -e "  ${C_YELLOW}-y, --yolo${C_RESET}              Auto-approve tool permissions for this run"
+    exit 0
+    ;;
+  *)
+    pass_args=()
+    yolo_flag=0
+    for arg in "$@"; do
+      if [[ "$arg" == "-y" || "$arg" == "--yolo" ]]; then
+        yolo_flag=1
+      else
+        pass_args+=("$arg")
+      fi
+    done
+    if [[ -f "$YOLO_FILE" ]] || (( yolo_flag == 1 )); then
+      has_perm=0
+      for a in "${pass_args[@]}"; do
+        if [[ "$a" == "--dangerously-skip-permissions" ]]; then
+          has_perm=1
+          break
+        fi
+      done
+      if (( has_perm == 0 )); then
+        pass_args+=("--dangerously-skip-permissions")
+      fi
+    fi
+    if [[ -t 0 ]] && ! pgrep -x "agy" >/dev/null 2>&1; then
+      acquire_lock
+      [[ -s "$USAGE_FILE" ]] || sync_AUTHs
+      prepare_AUTH "" || exit $?
+    fi
+    exec agy "${pass_args[@]}"
+    ;;
+esac

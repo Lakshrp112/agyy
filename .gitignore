@@ -1,0 +1,4 @@
+# Ignore all auth credentials, caches, and lock files
+auth/*
+!auth/
+!auth/.gitkeep
