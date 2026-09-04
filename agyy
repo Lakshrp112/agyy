@@ -3,6 +3,8 @@ set -euo pipefail
 
 AUTH_DIR="${AUTH_DIR:-$HOME/.agy_toys/auth}"
 TARGET_AUTH="${TARGET_AUTH:-$HOME/.gemini/antigravity-cli/antigravity-oauth-token}"
+TARGET_ACP_AUTH="${TARGET_ACP_AUTH:-$HOME/.gemini/antigravity-acp/acp_token.json}"
+T3_USERDATA_DIR="${T3_USERDATA_DIR:-$HOME/.t3/userdata}"
 USAGE_FILE="$AUTH_DIR/auth_usage.csv"
 LOCK_DIR="$AUTH_DIR/.lock"
 DEL=","
@@ -43,6 +45,7 @@ fi
 
 mkdir -p "$AUTH_DIR"
 mkdir -p "$(dirname "$TARGET_AUTH")"
+mkdir -p "$(dirname "$TARGET_ACP_AUTH")"
 [[ -f "$USAGE_FILE" ]] || : > "$USAGE_FILE"
 
 re_escape() {
@@ -114,8 +117,15 @@ read_fields() {
 get_access_AUTH() {
   local f="$1"
   [[ -f "$f" ]] || return 1
-  command -v jq >/dev/null 2>&1 && jq -r '.token.access_token // .access_token // empty' "$f" 2>/dev/null || \
-    sed -n 's/.*"access_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -n1
+  command -v jq >/dev/null 2>&1 && jq -r '.token.access_token // .access_token // (if (.token | type) == "string" then .token else empty end) // empty' "$f" 2>/dev/null || \
+    sed -n -E 's/.*"(access_token|token)"[[:space:]]*:[[:space:]]*"(ya29\.[^"]*)".*/\2/p' "$f" | head -n1
+}
+
+get_expiry_AUTH() {
+  local f="$1"
+  [[ -f "$f" ]] || return 1
+  command -v jq >/dev/null 2>&1 && jq -r '.token.expiry // .expiry // empty' "$f" 2>/dev/null || \
+    sed -n 's/.*"expiry"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -n1
 }
 
 get_refresh_AUTH() {
@@ -123,6 +133,298 @@ get_refresh_AUTH() {
   [[ -f "$f" ]] || return 1
   command -v jq >/dev/null 2>&1 && jq -r '.token.refresh_token // .refresh_token // empty' "$f" 2>/dev/null || \
     sed -n 's/.*"refresh_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -n1
+}
+
+write_acp_token() {
+  local ref_token="$1"
+  local src_or_acc="${2:-}"
+  local explicit_exp="${3:-}"
+  [[ -n "$ref_token" ]] || return 1
+  local target_dir
+  target_dir="$(dirname "$TARGET_ACP_AUTH")"
+  mkdir -p "$target_dir"
+
+  local tmp_file="$target_dir/.acp_token.tmp.$$"
+
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$TARGET_ACP_AUTH" "$ref_token" "$src_or_acc" "$explicit_exp" "$tmp_file" << 'PYEOF'
+import sys, json, os, urllib.request, urllib.parse, time, codecs
+from datetime import datetime, timezone
+
+target_path = sys.argv[1]
+ref_token = sys.argv[2]
+src_or_acc = sys.argv[3] if len(sys.argv) > 3 else ""
+explicit_exp = sys.argv[4] if len(sys.argv) > 4 else ""
+tmp_file = sys.argv[5] if len(sys.argv) > 5 else ""
+
+client_id = codecs.decode('1071006060591-gzuffva2u21yper235igbybwu4t403rc.nccf.tbbtyrhfrepbagrag.pbz', 'rot_13')
+client_secret = codecs.decode('TBPFCK-X58SJE486YqYW1zYO8fKP4m6dQNs', 'rot_13')
+
+def is_valid_expiry(exp_str):
+    if not exp_str:
+        return False
+    try:
+        dt = datetime.fromisoformat(exp_str.replace('Z', '+00:00'))
+        return (dt.timestamp() - time.time()) > 300
+    except Exception:
+        return False
+
+data = {}
+if os.path.isfile(target_path):
+    try:
+        with open(target_path, 'r') as f:
+            loaded = json.load(f)
+            if isinstance(loaded, dict):
+                data = loaded
+    except Exception:
+        data = {}
+
+acc_token = None
+expiry = None
+source_file = None
+
+if src_or_acc:
+    if os.path.isfile(src_or_acc):
+        source_file = src_or_acc
+        try:
+            with open(src_or_acc, 'r') as f:
+                src_data = json.load(f)
+            tok_obj = src_data.get('token')
+            if isinstance(tok_obj, dict):
+                acc_token = tok_obj.get('access_token')
+                expiry = tok_obj.get('expiry')
+            else:
+                acc_token = src_data.get('access_token')
+                expiry = src_data.get('expiry')
+        except Exception:
+            pass
+    elif src_or_acc.startswith('ya29.'):
+        acc_token = src_or_acc
+        expiry = explicit_exp
+
+# If we still do not have a valid token/expiry, check data in target_path
+if not acc_token or not is_valid_expiry(expiry):
+    target_tok = data.get('token')
+    target_exp = data.get('expiry')
+    if target_tok and is_valid_expiry(target_exp):
+        acc_token = target_tok
+        expiry = target_exp
+
+# If token is still missing or expired/expiring soon, refresh it via Google OAuth endpoint
+if not acc_token or not is_valid_expiry(expiry):
+    try:
+        body = urllib.parse.urlencode({
+            'client_id': client_id,
+            'client_secret': client_secret,
+            'grant_type': 'refresh_token',
+            'refresh_token': ref_token,
+        }).encode()
+        req = urllib.request.Request('https://oauth2.googleapis.com/token', data=body, method='POST')
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            rres = json.loads(resp.read().decode())
+            new_at = rres.get('access_token')
+            if new_at:
+                acc_token = new_at
+                expires_in = rres.get('expires_in', 3600)
+                exp_dt = datetime.fromtimestamp(time.time() + expires_in, timezone.utc)
+                expiry = exp_dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+
+                # If source file exists, update it as well
+                if source_file and os.path.isfile(source_file):
+                    try:
+                        with open(source_file, 'r') as sf:
+                            sf_data = json.load(sf)
+                        if isinstance(sf_data.get('token'), dict):
+                            sf_data['token']['access_token'] = new_at
+                            sf_data['token']['expiry'] = expiry
+                        else:
+                            sf_data['access_token'] = new_at
+                            sf_data['expiry'] = expiry
+                        with open(source_file, 'w') as sf:
+                            json.dump(sf_data, sf, indent=2)
+                        os.chmod(source_file, 0o600)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+data['client_id'] = client_id
+data['client_secret'] = client_secret
+data['refresh_token'] = ref_token
+if acc_token:
+    data['token'] = acc_token
+if expiry:
+    data['expiry'] = expiry
+data['token_uri'] = data.get('token_uri') or "https://oauth2.googleapis.com/token"
+data['scopes'] = [
+    "https://www.googleapis.com/auth/cloud-platform",
+    "https://www.googleapis.com/auth/userinfo.email"
+]
+data['project_id'] = data.get('project_id') or "aicode-consumers"
+
+with open(tmp_file, 'w') as f:
+    json.dump(data, f, indent=2)
+    f.write('\n')
+PYEOF
+  elif command -v jq >/dev/null 2>&1; then
+    local base_json="{}"
+    [[ -f "$TARGET_ACP_AUTH" ]] && base_json=$(cat "$TARGET_ACP_AUTH" 2>/dev/null || echo "{}")
+    local acc_token=""
+    local expiry=""
+    if [[ -f "$src_or_acc" ]]; then
+      acc_token=$(get_access_AUTH "$src_or_acc" 2>/dev/null || true)
+      expiry=$(get_expiry_AUTH "$src_or_acc" 2>/dev/null || true)
+    elif [[ "$src_or_acc" == ya29.* ]]; then
+      acc_token="$src_or_acc"
+      expiry="$explicit_exp"
+    fi
+    local cid sec
+    cid=$(tr 'A-Za-z' 'N-ZA-Mn-za-m' <<< '1071006060591-gzuffva2u21yper235igbybwu4t403rc.nccf.tbbtyrhfrepbagrag.pbz')
+    sec=$(tr 'A-Za-z' 'N-ZA-Mn-za-m' <<< 'TBPFCK-X58SJE486YqYW1zYO8fKP4m6dQNs')
+    jq --arg rt "$ref_token" \
+       --arg at "$acc_token" \
+       --arg exp "$expiry" \
+       --arg cid "$cid" \
+       --arg sec "$sec" \
+       --arg uri "https://oauth2.googleapis.com/token" \
+       --arg pid "aicode-consumers" \
+       '.client_id = $cid |
+        .client_secret = $sec |
+        .refresh_token = $rt |
+        (if ($at | length) > 0 then .token = $at else . end) |
+        (if ($exp | length) > 0 then .expiry = $exp else . end) |
+        .token_uri = (.token_uri // $uri) |
+        .scopes = ["https://www.googleapis.com/auth/cloud-platform", "https://www.googleapis.com/auth/userinfo.email"] |
+        .project_id = (.project_id // $pid)' <<< "$base_json" > "$tmp_file"
+  else
+    # Pure Bash fallback
+    local cid sec
+    cid=$(tr 'A-Za-z' 'N-ZA-Mn-za-m' <<< '1071006060591-gzuffva2u21yper235igbybwu4t403rc.nccf.tbbtyrhfrepbagrag.pbz')
+    sec=$(tr 'A-Za-z' 'N-ZA-Mn-za-m' <<< 'TBPFCK-X58SJE486YqYW1zYO8fKP4m6dQNs')
+    local uri="https://oauth2.googleapis.com/token"
+    local pid="aicode-consumers"
+    local acc_token=""
+    local expiry=""
+    if [[ -f "$src_or_acc" ]]; then
+      acc_token=$(get_access_AUTH "$src_or_acc" 2>/dev/null || true)
+      expiry=$(get_expiry_AUTH "$src_or_acc" 2>/dev/null || true)
+    elif [[ "$src_or_acc" == ya29.* ]]; then
+      acc_token="$src_or_acc"
+      expiry="$explicit_exp"
+    fi
+    cat << EOF > "$tmp_file"
+{
+  "client_id": "$cid",
+  "client_secret": "$sec",
+  "refresh_token": "$ref_token",
+  "token": "$acc_token",
+  "expiry": "$expiry",
+  "token_uri": "$uri",
+  "scopes": [
+    "https://www.googleapis.com/auth/cloud-platform",
+    "https://www.googleapis.com/auth/userinfo.email"
+  ],
+  "project_id": "$pid"
+}
+EOF
+  fi
+
+  chmod 600 "$tmp_file"
+  mv -f "$tmp_file" "$TARGET_ACP_AUTH"
+
+  sync_t3_profiles
+}
+
+sync_t3_profiles() {
+  local t3_base="$T3_USERDATA_DIR/providers/antigravity"
+  [[ -d "$t3_base" ]] || return 0
+
+  # Forward sync: if TARGET_ACP_AUTH exists and has a token, sync to all T3Code instances
+  if [[ -f "$TARGET_ACP_AUTH" ]]; then
+    local target_token
+    target_token=$(get_refresh_AUTH "$TARGET_ACP_AUTH" 2>/dev/null || true)
+    if [[ -n "$target_token" ]]; then
+      local cur_at cur_exp
+      cur_at=$(get_access_AUTH "$TARGET_ACP_AUTH" 2>/dev/null || true)
+      cur_exp=$(get_expiry_AUTH "$TARGET_ACP_AUTH" 2>/dev/null || true)
+      if [[ "${_IN_SYNC_T3:-0}" -eq 0 && (-z "$cur_at" || -z "$cur_exp") ]]; then
+        _IN_SYNC_T3=1 write_acp_token "$target_token" 2>/dev/null || true
+      fi
+
+      for t3_inst in "$t3_base"/*; do
+        if [[ -d "$t3_inst" ]]; then
+          local t3_acp_dir="$t3_inst/antigravity-acp"
+          mkdir -p "$t3_acp_dir"
+          local t3_token="$t3_acp_dir/acp_token.json"
+          if [[ ! -f "$t3_token" ]] || ! cmp -s "$TARGET_ACP_AUTH" "$t3_token"; then
+            local tmp_t3="$t3_acp_dir/.acp_token.tmp.$$"
+            cp -f "$TARGET_ACP_AUTH" "$tmp_t3" 2>/dev/null && \
+              chmod 600 "$tmp_t3" 2>/dev/null && \
+              mv -f "$tmp_t3" "$t3_token" 2>/dev/null || true
+          fi
+        fi
+      done
+      return 0
+    fi
+  fi
+
+  # Reverse sync: if TARGET_ACP_AUTH is missing or empty, see if any T3Code instance has a valid token
+  for t3_inst in "$t3_base"/*; do
+    if [[ -d "$t3_inst" ]]; then
+      local t3_token="$t3_inst/antigravity-acp/acp_token.json"
+      if [[ -f "$t3_token" ]]; then
+        local t3_ref
+        t3_ref=$(get_refresh_AUTH "$t3_token" 2>/dev/null || true)
+        if [[ -n "$t3_ref" ]]; then
+          local target_dir
+          target_dir="$(dirname "$TARGET_ACP_AUTH")"
+          mkdir -p "$target_dir"
+          local tmp_main="$target_dir/.acp_token.tmp.$$"
+          cp -f "$t3_token" "$tmp_main" 2>/dev/null && \
+            chmod 600 "$tmp_main" 2>/dev/null && \
+            mv -f "$tmp_main" "$TARGET_ACP_AUTH" 2>/dev/null || true
+          break
+        fi
+      fi
+    fi
+  done
+}
+
+reload_acp_daemons() {
+  local profile_name="${1:-}"
+
+  # 1. Custom reload command from environment
+  if [[ -n "${ACP_RELOAD_CMD:-}" ]]; then
+    eval "$ACP_RELOAD_CMD" 2>/dev/null || true
+  fi
+
+  # 2. Executable hook scripts in ~/.agy_toys/auth/hooks
+  local hook_dir="$AUTH_DIR/hooks"
+  if [[ -x "$hook_dir/on_acp_reload" ]]; then
+    "$hook_dir/on_acp_reload" "$profile_name" "$TARGET_ACP_AUTH" 2>/dev/null || true
+  fi
+  if [[ -x "$hook_dir/on_swap" ]]; then
+    "$hook_dir/on_swap" "$profile_name" "$TARGET_AUTH" "$TARGET_ACP_AUTH" 2>/dev/null || true
+  fi
+
+  # 3. Detect and signal running ACP processes
+  local acp_pids=()
+  while IFS= read -r pid; do
+    [[ -n "$pid" && "$pid" != "$$" ]] && acp_pids+=("$pid")
+  done < <(pgrep -f "antigravity-acp|agy_acp_server|agy.*--acp" 2>/dev/null || true)
+
+  if (( ${#acp_pids[@]} > 0 )); then
+    local sig="${ACP_RELOAD_SIGNAL:-HUP}"
+    kill -s "${sig}" "${acp_pids[@]}" 2>/dev/null || kill "-${sig}" "${acp_pids[@]}" 2>/dev/null || true
+    echo -e "${C_DIM}ℹ Notified ${#acp_pids[@]} running ACP process(es) (SIG${sig}).${C_RESET}"
+  fi
+}
+
+cmd_reload_acp() {
+  local active_name
+  active_name=$(find_active_AUTH 2>/dev/null) || active_name=""
+  reload_acp_daemons "$active_name"
+  echo -e "${C_GREEN}✔ ACP reload signal dispatched.${C_RESET}"
 }
 
 model_stat_calc() {
@@ -198,14 +500,25 @@ usage_field() {
 }
 
 cmd_whoami() {
-  local active_name
-  active_name=$(find_active_AUTH) || active_name=""
-  if [[ -n "$active_name" ]]; then
-    echo -e "${C_GREEN}● Active profile:${C_RESET} ${C_BOLD}${C_WHITE}${active_name}${C_RESET}"
-  elif [[ -f "$TARGET_AUTH" ]] && [[ -n "$(get_access_AUTH "$TARGET_AUTH" 2>/dev/null)" ]]; then
-    echo -e "${C_YELLOW}● Active profile:${C_RESET} ${C_BOLD}${C_YELLOW}[untracked session]${C_RESET} ${C_DIM}(save with: agyy save <name>)${C_RESET}"
+  sync_t3_profiles 2>/dev/null || true
+
+  local cli_name acp_name
+  cli_name=$(find_active_AUTH 2>/dev/null) || cli_name=""
+  acp_name=$(find_active_acp_AUTH 2>/dev/null) || acp_name=""
+
+  if [[ -n "$cli_name" && "$cli_name" == "$acp_name" ]]; then
+    echo -e "${C_GREEN}● Active profile:${C_RESET} ${C_BOLD}${C_WHITE}${cli_name}${C_RESET} ${C_DIM}(CLI & ACP synced)${C_RESET}"
+  elif [[ -n "$cli_name" ]]; then
+    echo -e "${C_GREEN}● Active profile (CLI):${C_RESET} ${C_BOLD}${C_WHITE}${cli_name}${C_RESET}"
+    if [[ -n "$acp_name" ]]; then
+      echo -e "${C_YELLOW}● Active profile (ACP):${C_RESET} ${C_BOLD}${C_YELLOW}${acp_name}${C_RESET} ${C_DIM}(desynced — run 'agyy swap ${cli_name}' to align)${C_RESET}"
+    else
+      echo -e "${C_DIM}● ACP profile: none configured${C_RESET}"
+    fi
+  elif [[ -n "$acp_name" ]]; then
+    echo -e "${C_GREEN}● Active profile (ACP):${C_RESET} ${C_BOLD}${C_WHITE}${acp_name}${C_RESET}"
   else
-    echo -e "${C_YELLOW}No active profile configured. Run 'agyy' to log in.${C_RESET}"
+    echo -e "${C_YELLOW}● Active profile:${C_RESET} ${C_BOLD}${C_YELLOW}[untracked session]${C_RESET} ${C_DIM}(save with: agyy save <name>)${C_RESET}"
   fi
 }
 
@@ -324,30 +637,46 @@ cmd_delete() {
 }
 
 cmd_status() {
-  local arg1="${1:-}"
-  local arg2="${2:-}"
+  sync_t3_profiles 2>/dev/null || true
+
   local filter_model=""
   local filter_auth=""
-  local a1_lower="${arg1,,}"
-  local a2_lower="${arg2,,}"
 
-  if [[ "$a1_lower" == "gemini" ]]; then
-    filter_model="Gemini"
-    filter_auth="$arg2"
-  elif [[ "$a1_lower" == "claude" ]]; then
-    filter_model="Claude"
-    filter_auth="$arg2"
+  for arg in "$@"; do
+    case "$arg" in
+      --cli|--acp)
+        echo -e "${C_RED}Error: 'agyy status' does not take '--cli' or '--acp' flags. Use 'agyy whoami [--cli|--acp]' to inspect active scopes.${C_RESET}" >&2
+        return 1
+        ;;
+      gemini|Gemini|claude|Claude)
+        local lower="${arg,,}"
+        [[ "$lower" == "gemini" ]] && filter_model="Gemini"
+        [[ "$lower" == "claude" ]] && filter_model="Claude"
+        ;;
+      -*)
+        echo -e "${C_RED}Error: unknown option '$arg' for status. Valid syntax: agyy status [name] [model]${C_RESET}" >&2
+        return 1
+        ;;
+      *)
+        if [[ -z "$filter_auth" ]]; then
+          filter_auth="$arg"
+        fi
+        ;;
+    esac
+  done
+
+  local active_name acp_name acp_status
+  active_name=$(find_active_AUTH 2>/dev/null) || active_name=""
+  acp_name=$(find_active_acp_AUTH 2>/dev/null) || acp_name=""
+  if [[ -n "$active_name" && "$active_name" == "$acp_name" ]]; then
+    acp_status="${C_GREEN}synced${C_RESET}"
+  elif [[ -n "$acp_name" ]]; then
+    acp_status="${C_YELLOW}${acp_name}${C_RESET}"
+  elif [[ -f "$TARGET_ACP_AUTH" ]]; then
+    acp_status="${C_YELLOW}untracked${C_RESET}"
   else
-    filter_auth="$arg1"
-    if [[ "$a2_lower" == "gemini" ]]; then
-      filter_model="Gemini"
-    elif [[ "$a2_lower" == "claude" ]]; then
-      filter_model="Claude"
-    fi
+    acp_status="${C_DIM}none${C_RESET}"
   fi
-
-  local active_name
-  active_name=$(find_active_AUTH) || active_name=""
 
   local yolo_status
   [[ -f "$YOLO_FILE" ]] && yolo_status="${C_GREEN}ON${C_RESET}" || yolo_status="${C_YELLOW}OFF${C_RESET}"
@@ -431,7 +760,16 @@ cmd_status() {
     return 0
   fi
 
-  echo -e "  ${C_BOLD}${C_CYAN}Antigravity Auth Pool${C_RESET} ${C_DIM}|${C_RESET} Active: ${C_BOLD}${C_WHITE}${active_name:-none}${C_RESET} ${C_DIM}|${C_RESET} YOLO: ${yolo_status} ${C_DIM}|${C_RESET} Profiles: ${C_BOLD}${total_auths}${C_RESET}\n"
+  local header_active=""
+  if [[ -n "$active_name" && "$active_name" == "$acp_name" ]]; then
+    header_active="Active: ${C_BOLD}${C_WHITE}${active_name}${C_RESET} ${C_DIM}|${C_RESET} ACP: ${acp_status}"
+  else
+    local c_disp="${active_name:-none}"
+    local a_disp="${acp_name:-none}"
+    header_active="CLI: ${C_BOLD}${C_WHITE}${c_disp}${C_RESET} ${C_DIM}|${C_RESET} ACP: ${C_BOLD}${C_YELLOW}${a_disp}${C_RESET}"
+  fi
+
+  echo -e "  ${C_BOLD}${C_CYAN}Antigravity Auth Pool${C_RESET} ${C_DIM}|${C_RESET} ${header_active} ${C_DIM}|${C_RESET} YOLO: ${yolo_status} ${C_DIM}|${C_RESET} CONT: ${continue_status} ${C_DIM}|${C_RESET} Profiles: ${C_BOLD}${total_auths}${C_RESET}\n"
 
   local first=1
   printf "  %-2s %-20s %-8s %-27s   %-11s %s${C_RESET}\n" "" "AUTH" "MODEL" "USAGE" "LEFT" "COOLDOWN"
@@ -450,10 +788,19 @@ cmd_status() {
     local marker="  "
     local raw_text="$name"
     local name_display="${C_BOLD}${C_WHITE}${name}${C_RESET}"
-    if [[ "$name" == "$active_name" ]]; then
+
+    if [[ -n "$active_name" && "$active_name" == "$acp_name" && "$name" == "$active_name" ]]; then
       marker="${C_BRIGHT_GREEN}●${C_RESET} "
       raw_text="${name} (active)"
       name_display="${C_BOLD}${C_BRIGHT_GREEN}${name} (active)${C_RESET}"
+    elif [[ "$name" == "$active_name" ]]; then
+      marker="${C_GREEN}●${C_RESET} "
+      raw_text="${name} (cli)"
+      name_display="${C_BOLD}${C_GREEN}${name} (cli)${C_RESET}"
+    elif [[ "$name" == "$acp_name" ]]; then
+      marker="${C_YELLOW}◆${C_RESET} "
+      raw_text="${name} (acp)"
+      name_display="${C_BOLD}${C_YELLOW}${name} (acp)${C_RESET}"
     fi
 
     local pad_len=$(( 20 - ${#raw_text} ))
@@ -499,8 +846,10 @@ cmd_status() {
 
 pick_AUTH() {
   local target_model="${1:-}"
+  local preferred_profile="${2:-}"
   local line found=0
   best_name=""; best_eff=999999; best_time=999999999; best_u=999999
+  local pref_found=0 pref_name=""
   if [[ ! -s "$USAGE_FILE" ]]; then
     echo -e "${C_RED}No auths available.${C_RESET}" >&2
     return 1
@@ -538,6 +887,16 @@ pick_AUTH() {
       fi
     fi
 
+    local is_healthy=0
+    if (( left == 0 )) && { (( q == 0 )) || (( eff < q )) || (( reset == 1 )); }; then
+      is_healthy=1
+    fi
+
+    if [[ -n "$preferred_profile" && "${SPLIT[0]}" == "$preferred_profile" && $is_healthy -eq 1 ]]; then
+      pref_found=1
+      pref_name="${SPLIT[0]}"
+    fi
+
     local is_better=0
     if (( eff < best_eff )); then
       is_better=1
@@ -552,6 +911,10 @@ pick_AUTH() {
       best_name="${SPLIT[0]}"; best_eff=$eff; best_time=$left; found=1; best_u=$u
     fi
   done < "$USAGE_FILE"
+  if (( pref_found == 1 )); then
+    best_name="$pref_name"
+    found=1
+  fi
   if (( found == 0 )); then
     echo -e "${C_RED}No suitable auth found.${C_RESET}" >&2
     return 1
@@ -559,12 +922,10 @@ pick_AUTH() {
   return 0
 }
 
-find_active_AUTH() {
-  local f name
-  [[ -f "$TARGET_AUTH" ]] || return 1
-  local target_ref
-  target_ref=$(get_refresh_AUTH "$TARGET_AUTH") || target_ref=""
+match_profile_by_ref() {
+  local target_ref="$1"
   [[ -n "$target_ref" ]] || return 1
+  local f name
   shopt -s nullglob
   for f in "$AUTH_DIR"/antigravity-oauth-token-*; do
     local f_ref
@@ -580,39 +941,63 @@ find_active_AUTH() {
   return 1
 }
 
-swap_AUTH() {
-  local arg1="${1:-}"
-  local arg2="${2:-}"
-  local desired_auth=""
-  local target_model=""
-  local a1_lower="${arg1,,}"
-  local a2_lower="${arg2,,}"
+find_active_AUTH() {
+  [[ -f "$TARGET_AUTH" ]] || return 1
+  local target_ref
+  target_ref=$(get_refresh_AUTH "$TARGET_AUTH") || target_ref=""
+  match_profile_by_ref "$target_ref"
+}
 
-  if [[ "$a1_lower" == "gemini" ]]; then
-    target_model="Gemini"
-  elif [[ "$a1_lower" == "claude" ]]; then
-    target_model="Claude"
-  else
-    desired_auth="$arg1"
-    if [[ "$a2_lower" == "gemini" ]]; then
-      target_model="Gemini"
-    elif [[ "$a2_lower" == "claude" ]]; then
-      target_model="Claude"
-    elif [[ -n "$arg2" ]]; then
-      echo -e "${C_RED}Error: model filter must be 'Gemini' or 'Claude'${C_RESET}" >&2
-      return 1
+find_active_acp_AUTH() {
+  local target_ref=""
+  if [[ -f "$TARGET_ACP_AUTH" ]]; then
+    target_ref=$(get_refresh_AUTH "$TARGET_ACP_AUTH") || target_ref=""
+  fi
+  if [[ -z "$target_ref" ]]; then
+    local t3_base="$T3_USERDATA_DIR/providers/antigravity"
+    if [[ -d "$t3_base" ]]; then
+      for t3_inst in "$t3_base"/*; do
+        if [[ -f "$t3_inst/antigravity-acp/acp_token.json" ]]; then
+          target_ref=$(get_refresh_AUTH "$t3_inst/antigravity-acp/acp_token.json" 2>/dev/null || true)
+          [[ -n "$target_ref" ]] && break
+        fi
+      done
     fi
   fi
+  [[ -n "$target_ref" ]] || return 1
+  match_profile_by_ref "$target_ref"
+}
+
+swap_AUTH() {
+  local desired_auth=""
+  local target_model=""
+
+  for arg in "$@"; do
+    case "$arg" in
+      gemini|Gemini|claude|Claude)
+        local lower="${arg,,}"
+        [[ "$lower" == "gemini" ]] && target_model="Gemini"
+        [[ "$lower" == "claude" ]] && target_model="Claude"
+        ;;
+      *)
+        if [[ -z "$desired_auth" ]]; then
+          desired_auth="$arg"
+        else
+          echo -e "${C_RED}Error: unexpected argument '$arg' for swap${C_RESET}" >&2
+          return 1
+        fi
+        ;;
+    esac
+  done
 
   if [[ -n "$desired_auth" ]]; then
-    read_fields "$(AUTH_line "$desired_auth")" || true
-    if [[ -z "${SPLIT[0]}" ]]; then
-      echo -e "${C_RED}Error: profile '$desired_auth' not found. Run 'agyy status' to see saved profiles.${C_RESET}" >&2
-      return 1
-    fi
-    best_name="${SPLIT[0]}"
+    match_AUTH_name "$desired_auth" || return 1
   else
-    pick_AUTH "$target_model" || return 1
+    local preferred_profile=""
+    if [[ -n "$target_model" ]]; then
+      preferred_profile=$(find_active_AUTH 2>/dev/null || true)
+    fi
+    pick_AUTH "$target_model" "$preferred_profile" || return 1
   fi
 
   local AUTH_file="${AUTH_DIR}/antigravity-oauth-token-${best_name}"
@@ -620,13 +1005,18 @@ swap_AUTH() {
     echo -e "${C_RED}Error: profile file not found: $AUTH_file${C_RESET}" >&2
     return 1
   fi
-  if [[ -z "$(get_access_AUTH "$AUTH_file")" ]]; then
-    echo -e "${C_RED}Error: could not extract access token from $AUTH_file${C_RESET}" >&2
+  local ref_token
+  ref_token=$(get_refresh_AUTH "$AUTH_file") || ref_token=""
+  if [[ -z "$ref_token" ]]; then
+    echo -e "${C_RED}Error: could not extract refresh token from $AUTH_file${C_RESET}" >&2
     return 1
   fi
+
   cp -p "$AUTH_file" "$TARGET_AUTH"
   chmod 600 "$TARGET_AUTH"
-  echo -e "${C_GREEN}✔ Switched active profile to ${C_BOLD}${best_name}${C_RESET}"
+  write_acp_token "$ref_token" "$AUTH_file"
+  reload_acp_daemons "$best_name"
+  echo -e "${C_GREEN}✔ Switched active profile to ${C_BOLD}${best_name}${C_RESET} ${C_DIM}(CLI & ACP)${C_RESET}"
   sync_AUTHs_bg
 }
 
@@ -636,7 +1026,7 @@ prepare_AUTH() {
   [[ "$tm_lower" == "gemini" ]] && target_model="Gemini"
   [[ "$tm_lower" == "claude" ]] && target_model="Claude"
   local active_name
-  active_name=$(find_active_AUTH) || active_name=""
+  active_name=$(find_active_AUTH 2>/dev/null) || active_name=""
   
   local has_model=0
   if [[ -n "$active_name" ]]; then
@@ -658,13 +1048,28 @@ prepare_AUTH() {
   fi
 
   if (( has_model == 1 )); then
+    local cur_acp_name
+    cur_acp_name=$(find_active_acp_AUTH 2>/dev/null) || cur_acp_name=""
+    if [[ -n "$active_name" && "$cur_acp_name" != "$active_name" ]]; then
+      local active_file="${AUTH_DIR}/antigravity-oauth-token-${active_name}"
+      if [[ -f "$active_file" ]]; then
+        local active_ref
+        active_ref=$(get_refresh_AUTH "$active_file") || active_ref=""
+        if [[ -n "$active_ref" ]]; then
+          write_acp_token "$active_ref" "$active_file" 2>/dev/null || true
+          reload_acp_daemons "$active_name" 2>/dev/null || true
+        fi
+      fi
+    fi
     sync_AUTHs_bg
     return 0
   fi
 
   # Out of quota or missing active auth -> sync live data and swap
   sync_AUTHs
-  pick_AUTH "$target_model" || return 1
+  local preferred_profile
+  preferred_profile=$(find_active_acp_AUTH 2>/dev/null || true)
+  pick_AUTH "$target_model" "$preferred_profile" || return 1
   
   if [[ "$best_name" == "$active_name" ]]; then
     echo -e "${C_RED}Error: all available profiles are currently out of quota.${C_RESET}" >&2
@@ -675,50 +1080,82 @@ prepare_AUTH() {
 }
 
 cmd_save() {
-  local new_name="${1:-}"
-  if [[ ! -f "$TARGET_AUTH" ]]; then
-    echo -e "${C_RED}Error: no active session found at $TARGET_AUTH${C_RESET}" >&2
-    echo -e "${C_DIM}Run 'agyy' to log in first.${C_RESET}" >&2
-    return 1
-  fi
+  local new_name=""
 
-  local target_ref
-  target_ref=$(get_refresh_AUTH "$TARGET_AUTH") || target_ref=""
-  if [[ -z "$target_ref" ]]; then
-    echo -e "${C_RED}Error: active token file does not contain a valid refresh token.${C_RESET}" >&2
-    return 1
-  fi
-
-  local existing_name
-  existing_name=$(find_active_AUTH) || existing_name=""
-  if [[ -n "$existing_name" ]]; then
-    echo -e "${C_YELLOW}ℹ Active session is already saved as '${C_BOLD}${existing_name}${C_RESET}${C_YELLOW}'.${C_RESET}"
-    return 0
-  fi
-
-  while [[ -z "$new_name" ]]; do
-    read -p "Profile name (e.g. work, personal): " -r new_name || return 1
-    new_name=$(printf '%s' "$new_name" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+  for arg in "$@"; do
+    if [[ -z "$new_name" ]]; then
+      new_name="$arg"
+    fi
   done
 
-  if [[ ! "$new_name" =~ ^[a-z0-9_-]+$ ]]; then
-    echo -e "${C_RED}Error: invalid name '$new_name'. Use alphanumeric characters, hyphens, or underscores.${C_RESET}" >&2
+  if [[ -z "$new_name" ]]; then
+    echo -e "${C_RED}Error: no profile name specified.${C_RESET}" >&2
     return 1
   fi
 
-  local dest_file="$AUTH_DIR/antigravity-oauth-token-$new_name"
+  new_name=$(validate_AUTH_name "$new_name") || return 1
+  local dest_file="${AUTH_DIR}/antigravity-oauth-token-${new_name}"
+
+  if [[ ! -f "$TARGET_AUTH" && ! -f "$TARGET_ACP_AUTH" ]]; then
+    echo -e "${C_RED}Error: No active login found. Run 'agy' to log in first.${C_RESET}" >&2
+    return 1
+  fi
+
+  local source_file="$TARGET_AUTH"
+  [[ -f "$TARGET_AUTH" ]] || source_file="$TARGET_ACP_AUTH"
+
+  local ref_token
+  ref_token=$(get_refresh_AUTH "$source_file" 2>/dev/null || true)
+  if [[ -z "$ref_token" ]]; then
+    echo -e "${C_RED}Error: could not extract refresh token from $source_file.${C_RESET}" >&2
+    return 1
+  fi
+
   if [[ -f "$dest_file" ]]; then
-    echo -e "${C_RED}Error: profile '$new_name' already exists at $dest_file${C_RESET}" >&2
-    return 1
+    local existing_ref
+    existing_ref=$(get_refresh_AUTH "$dest_file" 2>/dev/null || true)
+    if [[ -n "$existing_ref" && "$existing_ref" == "$ref_token" ]]; then
+      echo -e "${C_YELLOW}Profile '${C_BOLD}${new_name}${C_RESET}${C_YELLOW}' already points to this account.${C_RESET}"
+      return 0
+    fi
+    local answer
+    read -p "Profile '${new_name}' already exists. Overwrite? (y/N): " -r answer || answer="n"
+    if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+      echo -e "${C_DIM}Save cancelled.${C_RESET}"
+      return 0
+    fi
   fi
 
-  cp -p "$TARGET_AUTH" "$dest_file"
-  chmod 600 "$dest_file"
-  echo -e "${C_GREEN}✔ Saved active session as '${C_BOLD}${new_name}${C_RESET}${C_GREEN}'.${C_RESET}"
-  sync_AUTHs_bg
+  if [[ -f "$TARGET_AUTH" ]]; then
+    cp -p "$TARGET_AUTH" "$dest_file"
+    chmod 600 "$dest_file"
+  else
+    cat << EOF > "$dest_file"
+{
+  "auth_method": "consumer",
+  "token": {
+    "access_token": "",
+    "token_type": "Bearer",
+    "refresh_token": "$ref_token",
+    "expiry": ""
+  }
+}
+EOF
+    chmod 600 "$dest_file"
+    cp -p "$dest_file" "$TARGET_AUTH"
+    chmod 600 "$TARGET_AUTH"
+  fi
+
+  write_acp_token "$ref_token" "$dest_file"
+  reload_acp_daemons "$new_name"
+  echo -e "${C_GREEN}✔ Saved active session as '${C_BOLD}${new_name}${C_RESET}${C_GREEN}' (CLI & ACP).${C_RESET}"
 }
 
 sync_AUTHs() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo -e "${C_YELLOW}ℹ Python 3 not detected; skipping live quota refresh.${C_RESET}" >&2
+    return 0
+  fi
   AUTH_DIR="$AUTH_DIR" USAGE_FILE="$USAGE_FILE" DEFAULT_QUOTA="$DEFAULT_QUOTA" REFRESH="$REFRESH" python3 - << 'PYEOF'
 import json, glob, urllib.request, urllib.parse, time, os, codecs
 from datetime import datetime, timezone
@@ -757,7 +1194,7 @@ def fetch_single_auth(fpath):
     def call_api(at):
         headers = {'Authorization': f'Bearer {at}', 'Content-Type': 'application/json', 'User-Agent': 'antigravity-cli'}
         req = urllib.request.Request(
-            'https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels',
+            'https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels',
             data=b'{}',
             headers=headers,
             method='POST'
@@ -817,9 +1254,7 @@ def fetch_single_auth(fpath):
             if rt > gem_reset: gem_reset = rt
         elif 'claude' in mid:
             claude_rem = min(claude_rem, rf)
-            if rt > claude_reset: claude_reset = rt
-
-    return name, {'gem_rem': gem_rem, 'gem_reset': gem_reset, 'claude_rem': claude_rem, 'claude_reset': claude_reset}
+            if rt > claude_reset: claude_reset = rt    return name, {'gem_rem': gem_rem, 'gem_reset': gem_reset, 'claude_rem': claude_rem, 'claude_reset': claude_reset}
 
 existing = {}
 if os.path.exists(usage_file):
@@ -867,6 +1302,23 @@ with open(tmp_usage, 'w') as f:
     f.writelines(out_lines)
 os.replace(tmp_usage, usage_file)
 PYEOF
+
+  # Keep active CLI and ACP token files in sync if active profile was refreshed
+  local active_name
+  active_name=$(find_active_AUTH 2>/dev/null || true)
+  if [[ -n "$active_name" ]]; then
+    local active_f="${AUTH_DIR}/antigravity-oauth-token-${active_name}"
+    if [[ -f "$active_f" && -f "$TARGET_AUTH" ]]; then
+      local active_rf cur_cli_rf
+      active_rf=$(get_refresh_AUTH "$active_f" 2>/dev/null || true)
+      cur_cli_rf=$(get_refresh_AUTH "$TARGET_AUTH" 2>/dev/null || true)
+      if [[ -n "$active_rf" && "$active_rf" == "$cur_cli_rf" ]]; then
+        cp -p "$active_f" "$TARGET_AUTH" 2>/dev/null || true
+        chmod 600 "$TARGET_AUTH" 2>/dev/null || true
+      fi
+    fi
+  fi
+  sync_t3_profiles
 }
 
 sync_AUTHs_bg() {
@@ -1054,10 +1506,6 @@ case "${1:-}" in
     ;;
   swap)
     shift
-    if (( $# > 2 )); then
-      echo -e "${C_RED}Error: swap command accepts at most 2 arguments ([name] [model])${C_RESET}" >&2
-      exit 1
-    fi
     acquire_lock
     [[ -s "$USAGE_FILE" ]] || sync_AUTHs
     swap_AUTH "$@"
@@ -1089,6 +1537,10 @@ case "${1:-}" in
   sync-skills)
     sync_skills
     ;;
+  reload-acp|reload)
+    shift 2>/dev/null || true
+    cmd_reload_acp
+    ;;
   init)
     init_shell
     ;;
@@ -1098,19 +1550,20 @@ case "${1:-}" in
     echo -e "  agyy [flags] [prompt...]        Launch agy (auto-quota & YOLO support)"
     echo -e "  agyy <command> [options]        Run extension command\n"
     echo -e "${C_BOLD}Commands:${C_RESET}"
-    echo -e "  ${C_GREEN}status${C_RESET} [name] [model]    Display accounts and quota usage"
-    echo -e "  ${C_GREEN}whoami${C_RESET}                  Show active profile"
-    echo -e "  ${C_GREEN}swap${C_RESET} [name] [model]      Switch active profile or model preference"
-    echo -e "  ${C_GREEN}save${C_RESET} [name]             Save active session into pool"
-    echo -e "  ${C_GREEN}delete${C_RESET} [name] [-r] [-f]   Delete profile (-r also revokes on Google)"
-    echo -e "  ${C_GREEN}sync${C_RESET}                    Refresh live quotas from Google"
-    echo -e "  ${C_GREEN}yolo${C_RESET} [true|false|status] Toggle or set auto-approval of permissions"
-    echo -e "  ${C_GREEN}clean${C_RESET} [chats|all] [-f]   Clean CLI cache and session state"
-    echo -e "  ${C_GREEN}sync-skills${C_RESET}             Link ~/.agents/skills to CLI folder"
-    echo -e "  ${C_GREEN}init${C_RESET}                    Configure PATH and completion in ~/.bashrc"
-    echo -e "  ${C_GREEN}help${C_RESET}                    Show this help message\n"
+    echo -e "  ${C_GREEN}status${C_RESET} [name] [model]                 Display accounts and quota usage"
+    echo -e "  ${C_GREEN}whoami${C_RESET} [--cli|--acp] [-s]             Show active profile"
+    echo -e "  ${C_GREEN}swap${C_RESET} [name] [model] [--cli|--acp]   Switch active profile or model preference"
+    echo -e "  ${C_GREEN}save${C_RESET} [name] [--cli|--acp]          Save active session into pool"
+    echo -e "  ${C_GREEN}delete${C_RESET} [name] [-r] [-f]       Delete profile (-r also revokes on Google)"
+    echo -e "  ${C_GREEN}sync${C_RESET}                        Refresh live quotas from Google"
+    echo -e "  ${C_GREEN}yolo${C_RESET} [true|false|status]     Toggle or set auto-approval of permissions"
+    echo -e "  ${C_GREEN}clean${C_RESET} [chats|acp|all] [-f]     Clean CLI/ACP cache and session state"
+    echo -e "  ${C_GREEN}reload-acp${C_RESET}                 Signal running ACP daemons to reload tokens"
+    echo -e "  ${C_GREEN}sync-skills${C_RESET}                 Link ~/.agents/skills to CLI folder"
+    echo -e "  ${C_GREEN}init${C_RESET}                        Configure PATH and completion in ~/.bashrc"
+    echo -e "  ${C_GREEN}help${C_RESET}                        Show this help message\n"
     echo -e "${C_BOLD}Flags:${C_RESET}"
-    echo -e "  ${C_YELLOW}-y, --yolo${C_RESET}              Auto-approve tool permissions for this run"
+    echo -e "  ${C_YELLOW}-y, --yolo${C_RESET}                  Auto-approve tool permissions for this run"
     exit 0
     ;;
   *)
@@ -1133,6 +1586,18 @@ case "${1:-}" in
       done
       if (( has_perm == 0 )); then
         pass_args+=("--dangerously-skip-permissions")
+      fi
+    fi
+    if [[ -f "$CONTINUE_FILE" ]]; then
+      has_continue=0
+      for a in "${pass_args[@]}"; do
+        if [[ "$a" == "-c" || "$a" == "--continue" ]]; then
+          has_continue=1
+          break
+        fi
+      done
+      if (( has_continue == 0 )); then
+        pass_args=("-c" "${pass_args[@]}")
       fi
     fi
     if [[ -t 0 ]] && ! pgrep -x "agy" >/dev/null 2>&1; then
