@@ -500,11 +500,79 @@ usage_field() {
 }
 
 cmd_whoami() {
+  local scope="all" short=0
+  for arg in "$@"; do
+    case "$arg" in
+      --cli)
+        scope="cli"
+        ;;
+      --acp)
+        scope="acp"
+        ;;
+      -s|--short)
+        short=1
+        ;;
+      *)
+        echo -e "${C_RED}Error: unknown option '$arg' for whoami. Valid options: --cli, --acp, -s, --short${C_RESET}" >&2
+        return 1
+        ;;
+    esac
+  done
+
   sync_t3_profiles 2>/dev/null || true
 
   local cli_name acp_name
   cli_name=$(find_active_AUTH 2>/dev/null) || cli_name=""
   acp_name=$(find_active_acp_AUTH 2>/dev/null) || acp_name=""
+
+  local cli_ref acp_ref
+  cli_ref=$(get_refresh_AUTH "$TARGET_AUTH" 2>/dev/null) || cli_ref=""
+  acp_ref=$(get_refresh_AUTH "$TARGET_ACP_AUTH" 2>/dev/null) || acp_ref=""
+
+  if (( short == 1 )); then
+    if [[ "$scope" == "cli" ]]; then
+      if [[ -n "$cli_name" ]]; then
+        echo "$cli_name"
+        return 0
+      fi
+      return 1
+    elif [[ "$scope" == "acp" ]]; then
+      if [[ -n "$acp_name" ]]; then
+        echo "$acp_name"
+        return 0
+      fi
+      return 1
+    else
+      if [[ -n "$cli_name" && "$cli_name" == "$acp_name" ]]; then
+        echo "$cli_name"
+        return 0
+      elif [[ -n "$cli_name" || -n "$acp_name" ]]; then
+        echo "cli:${cli_name:-none} acp:${acp_name:-none}"
+        return 0
+      fi
+      return 1
+    fi
+  fi
+
+  if [[ "$scope" == "cli" ]]; then
+    if [[ -n "$cli_name" ]]; then
+      echo -e "${C_GREEN}● Active profile (CLI):${C_RESET} ${C_BOLD}${C_WHITE}${cli_name}${C_RESET}"
+    elif [[ -n "$cli_ref" ]]; then
+      echo -e "${C_YELLOW}● Active profile (CLI):${C_RESET} ${C_BOLD}${C_YELLOW}[untracked session]${C_RESET} ${C_DIM}(save with: agyy save <name>)${C_RESET}"
+    else
+      echo -e "${C_DIM}● CLI profile: none configured${C_RESET}"
+    fi
+    return 0
+  elif [[ "$scope" == "acp" ]]; then
+    if [[ -n "$acp_name" ]]; then
+      echo -e "${C_GREEN}● Active profile (ACP):${C_RESET} ${C_BOLD}${C_WHITE}${acp_name}${C_RESET}"
+    elif [[ -n "$acp_ref" ]]; then
+      echo -e "${C_YELLOW}● Active profile (ACP):${C_RESET} ${C_BOLD}${C_YELLOW}[untracked session]${C_RESET} ${C_DIM}(save with: agyy save <name> --acp)${C_RESET}"
+    else
+      echo -e "${C_DIM}● ACP profile: none configured${C_RESET}"
+    fi
+    return 0
+  fi
 
   if [[ -n "$cli_name" && "$cli_name" == "$acp_name" ]]; then
     echo -e "${C_GREEN}● Active profile:${C_RESET} ${C_BOLD}${C_WHITE}${cli_name}${C_RESET} ${C_DIM}(CLI & ACP synced)${C_RESET}"
@@ -512,13 +580,27 @@ cmd_whoami() {
     echo -e "${C_GREEN}● Active profile (CLI):${C_RESET} ${C_BOLD}${C_WHITE}${cli_name}${C_RESET}"
     if [[ -n "$acp_name" ]]; then
       echo -e "${C_YELLOW}● Active profile (ACP):${C_RESET} ${C_BOLD}${C_YELLOW}${acp_name}${C_RESET} ${C_DIM}(desynced — run 'agyy swap ${cli_name}' to align)${C_RESET}"
+    elif [[ -n "$acp_ref" ]]; then
+      echo -e "${C_YELLOW}● Active profile (ACP):${C_RESET} ${C_BOLD}${C_YELLOW}[untracked session]${C_RESET} ${C_DIM}(save with: agyy save <name> --acp)${C_RESET}"
     else
       echo -e "${C_DIM}● ACP profile: none configured${C_RESET}"
     fi
   elif [[ -n "$acp_name" ]]; then
+    if [[ -n "$cli_ref" ]]; then
+      echo -e "${C_YELLOW}● Active profile (CLI):${C_RESET} ${C_BOLD}${C_YELLOW}[untracked session]${C_RESET} ${C_DIM}(save with: agyy save <name>)${C_RESET}"
+    else
+      echo -e "${C_DIM}● CLI profile: none configured${C_RESET}"
+    fi
     echo -e "${C_GREEN}● Active profile (ACP):${C_RESET} ${C_BOLD}${C_WHITE}${acp_name}${C_RESET}"
+  elif [[ -n "$cli_ref" || -n "$acp_ref" ]]; then
+    if [[ -n "$cli_ref" ]]; then
+      echo -e "${C_YELLOW}● Active profile (CLI):${C_RESET} ${C_BOLD}${C_YELLOW}[untracked session]${C_RESET} ${C_DIM}(save with: agyy save <name>)${C_RESET}"
+    fi
+    if [[ -n "$acp_ref" ]]; then
+      echo -e "${C_YELLOW}● Active profile (ACP):${C_RESET} ${C_BOLD}${C_YELLOW}[untracked session]${C_RESET} ${C_DIM}(save with: agyy save <name> --acp)${C_RESET}"
+    fi
   else
-    echo -e "${C_YELLOW}● Active profile:${C_RESET} ${C_BOLD}${C_YELLOW}[untracked session]${C_RESET} ${C_DIM}(save with: agyy save <name>)${C_RESET}"
+    echo -e "${C_YELLOW}No active profile configured. Run 'agyy' to log in.${C_RESET}"
   fi
 }
 
@@ -969,11 +1051,18 @@ find_active_acp_AUTH() {
 }
 
 swap_AUTH() {
+  local target_scope="all"
   local desired_auth=""
   local target_model=""
 
   for arg in "$@"; do
     case "$arg" in
+      --cli)
+        target_scope="cli"
+        ;;
+      --acp)
+        target_scope="acp"
+        ;;
       gemini|Gemini|claude|Claude)
         local lower="${arg,,}"
         [[ "$lower" == "gemini" ]] && target_model="Gemini"
@@ -991,10 +1080,17 @@ swap_AUTH() {
   done
 
   if [[ -n "$desired_auth" ]]; then
-    match_AUTH_name "$desired_auth" || return 1
+    read_fields "$(AUTH_line "$desired_auth")" || true
+    if [[ -z "${SPLIT[0]}" ]]; then
+      echo -e "${C_RED}Error: profile '$desired_auth' not found. Run 'agyy status' to see saved profiles.${C_RESET}" >&2
+      return 1
+    fi
+    best_name="${SPLIT[0]}"
   else
     local preferred_profile=""
-    if [[ -n "$target_model" ]]; then
+    if [[ "$target_scope" == "cli" ]]; then
+      preferred_profile=$(find_active_acp_AUTH 2>/dev/null || true)
+    elif [[ "$target_scope" == "acp" ]]; then
       preferred_profile=$(find_active_AUTH 2>/dev/null || true)
     fi
     pick_AUTH "$target_model" "$preferred_profile" || return 1
@@ -1012,11 +1108,21 @@ swap_AUTH() {
     return 1
   fi
 
-  cp -p "$AUTH_file" "$TARGET_AUTH"
-  chmod 600 "$TARGET_AUTH"
-  write_acp_token "$ref_token" "$AUTH_file"
-  reload_acp_daemons "$best_name"
-  echo -e "${C_GREEN}✔ Switched active profile to ${C_BOLD}${best_name}${C_RESET} ${C_DIM}(CLI & ACP)${C_RESET}"
+  if [[ "$target_scope" == "cli" ]]; then
+    cp -p "$AUTH_file" "$TARGET_AUTH"
+    chmod 600 "$TARGET_AUTH"
+    echo -e "${C_GREEN}✔ Switched active CLI profile to ${C_BOLD}${best_name}${C_RESET} ${C_DIM}(CLI only)${C_RESET}"
+  elif [[ "$target_scope" == "acp" ]]; then
+    write_acp_token "$ref_token" "$AUTH_file"
+    reload_acp_daemons "$best_name"
+    echo -e "${C_GREEN}✔ Switched active ACP profile to ${C_BOLD}${best_name}${C_RESET} ${C_DIM}(ACP only)${C_RESET}"
+  else
+    cp -p "$AUTH_file" "$TARGET_AUTH"
+    chmod 600 "$TARGET_AUTH"
+    write_acp_token "$ref_token" "$AUTH_file"
+    reload_acp_daemons "$best_name"
+    echo -e "${C_GREEN}✔ Switched active profile to ${C_BOLD}${best_name}${C_RESET} ${C_DIM}(CLI & ACP)${C_RESET}"
+  fi
   sync_AUTHs_bg
 }
 
@@ -1081,52 +1187,118 @@ prepare_AUTH() {
 
 cmd_save() {
   local new_name=""
+  local force_source=""
 
   for arg in "$@"; do
-    if [[ -z "$new_name" ]]; then
+    if [[ "$arg" == "--acp" ]]; then
+      force_source="acp"
+    elif [[ "$arg" == "--cli" ]]; then
+      force_source="cli"
+    elif [[ -z "$new_name" ]]; then
       new_name="$arg"
     fi
   done
 
-  if [[ -z "$new_name" ]]; then
-    echo -e "${C_RED}Error: no profile name specified.${C_RESET}" >&2
+  local cli_ref acp_ref cli_tracked acp_tracked
+  sync_t3_profiles 2>/dev/null || true
+  cli_ref=$(get_refresh_AUTH "$TARGET_AUTH" 2>/dev/null || true)
+  acp_ref=$(get_refresh_AUTH "$TARGET_ACP_AUTH" 2>/dev/null || true)
+  cli_tracked=$(find_active_AUTH 2>/dev/null || true)
+  acp_tracked=$(find_active_acp_AUTH 2>/dev/null || true)
+
+  local source_type=""
+  local source_ref=""
+
+  if [[ "$force_source" == "acp" ]]; then
+    if [[ -z "$acp_ref" ]]; then
+      echo -e "${C_RED}Error: no active ACP session found at $TARGET_ACP_AUTH${C_RESET}" >&2
+      return 1
+    fi
+    if [[ -n "$acp_tracked" ]]; then
+      echo -e "${C_YELLOW}ℹ Active ACP session is already saved as '${C_BOLD}${acp_tracked}${C_RESET}${C_YELLOW}'.${C_RESET}"
+      return 0
+    fi
+    source_type="acp"
+    source_ref="$acp_ref"
+  elif [[ "$force_source" == "cli" ]]; then
+    if [[ -z "$cli_ref" ]]; then
+      echo -e "${C_RED}Error: no active CLI session found at $TARGET_AUTH${C_RESET}" >&2
+      echo -e "${C_DIM}Run 'agyy' to log in first.${C_RESET}" >&2
+      return 1
+    fi
+    if [[ -n "$cli_tracked" ]]; then
+      echo -e "${C_YELLOW}ℹ Active CLI session is already saved as '${C_BOLD}${cli_tracked}${C_RESET}${C_YELLOW}'.${C_RESET}"
+      return 0
+    fi
+    source_type="cli"
+    source_ref="$cli_ref"
+  else
+    if [[ -z "$cli_ref" && -z "$acp_ref" ]]; then
+      echo -e "${C_RED}Error: no active session found at $TARGET_AUTH or $TARGET_ACP_AUTH${C_RESET}" >&2
+      echo -e "${C_DIM}Run 'agyy' or your ACP editor plugin to log in first.${C_RESET}" >&2
+      return 1
+    fi
+
+    if [[ -n "$cli_ref" && -z "$acp_ref" ]]; then
+      if [[ -n "$cli_tracked" ]]; then
+        echo -e "${C_YELLOW}ℹ Active CLI session is already saved as '${C_BOLD}${cli_tracked}${C_RESET}${C_YELLOW}'.${C_RESET}"
+        return 0
+      fi
+      source_type="cli"
+      source_ref="$cli_ref"
+    elif [[ -z "$cli_ref" && -n "$acp_ref" ]]; then
+      if [[ -n "$acp_tracked" ]]; then
+        echo -e "${C_YELLOW}ℹ Active ACP session is already saved as '${C_BOLD}${acp_tracked}${C_RESET}${C_YELLOW}'.${C_RESET}"
+        return 0
+      fi
+      source_type="acp"
+      source_ref="$acp_ref"
+    else
+      if [[ "$cli_ref" == "$acp_ref" ]]; then
+        if [[ -n "$cli_tracked" ]]; then
+          echo -e "${C_YELLOW}ℹ Active session is already saved as '${C_BOLD}${cli_tracked}${C_RESET}${C_YELLOW}'.${C_RESET}"
+          return 0
+        fi
+        source_type="cli"
+        source_ref="$cli_ref"
+      else
+        if [[ -n "$cli_tracked" && -z "$acp_tracked" ]]; then
+          echo -e "${C_DIM}ℹ CLI session is already tracked ('${cli_tracked}'). Saving untracked ACP session.${C_RESET}"
+          source_type="acp"
+          source_ref="$acp_ref"
+        elif [[ -z "$cli_tracked" && -n "$acp_tracked" ]]; then
+          echo -e "${C_DIM}ℹ ACP session is already tracked ('${acp_tracked}'). Saving untracked CLI session.${C_RESET}"
+          source_type="cli"
+          source_ref="$cli_ref"
+        elif [[ -n "$cli_tracked" && -n "$acp_tracked" ]]; then
+          echo -e "${C_YELLOW}ℹ Both sessions are already tracked (CLI: '${cli_tracked}', ACP: '${acp_tracked}').${C_RESET}"
+          return 0
+        else
+          echo -e "${C_YELLOW}ℹ Both CLI and ACP have differing untracked sessions. Saving CLI by default (use --acp to save ACP).${C_RESET}"
+          source_type="cli"
+          source_ref="$cli_ref"
+        fi
+      fi
+    fi
+  fi
+
+  while [[ -z "$new_name" ]]; do
+    read -p "Profile name (e.g. work, personal): " -r new_name || return 1
+    new_name=$(printf '%s' "$new_name" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+  done
+
+  if [[ ! "$new_name" =~ ^[a-z0-9_-]+$ ]]; then
+    echo -e "${C_RED}Error: invalid name '$new_name'. Use alphanumeric characters, hyphens, or underscores.${C_RESET}" >&2
     return 1
   fi
 
-  new_name=$(validate_AUTH_name "$new_name") || return 1
-  local dest_file="${AUTH_DIR}/antigravity-oauth-token-${new_name}"
-
-  if [[ ! -f "$TARGET_AUTH" && ! -f "$TARGET_ACP_AUTH" ]]; then
-    echo -e "${C_RED}Error: No active login found. Run 'agy' to log in first.${C_RESET}" >&2
-    return 1
-  fi
-
-  local source_file="$TARGET_AUTH"
-  [[ -f "$TARGET_AUTH" ]] || source_file="$TARGET_ACP_AUTH"
-
-  local ref_token
-  ref_token=$(get_refresh_AUTH "$source_file" 2>/dev/null || true)
-  if [[ -z "$ref_token" ]]; then
-    echo -e "${C_RED}Error: could not extract refresh token from $source_file.${C_RESET}" >&2
-    return 1
-  fi
-
+  local dest_file="$AUTH_DIR/antigravity-oauth-token-$new_name"
   if [[ -f "$dest_file" ]]; then
-    local existing_ref
-    existing_ref=$(get_refresh_AUTH "$dest_file" 2>/dev/null || true)
-    if [[ -n "$existing_ref" && "$existing_ref" == "$ref_token" ]]; then
-      echo -e "${C_YELLOW}Profile '${C_BOLD}${new_name}${C_RESET}${C_YELLOW}' already points to this account.${C_RESET}"
-      return 0
-    fi
-    local answer
-    read -p "Profile '${new_name}' already exists. Overwrite? (y/N): " -r answer || answer="n"
-    if [[ ! "$answer" =~ ^[Yy]$ ]]; then
-      echo -e "${C_DIM}Save cancelled.${C_RESET}"
-      return 0
-    fi
+    echo -e "${C_RED}Error: profile '$new_name' already exists at $dest_file${C_RESET}" >&2
+    return 1
   fi
 
-  if [[ -f "$TARGET_AUTH" ]]; then
+  if [[ "$source_type" == "cli" ]]; then
     cp -p "$TARGET_AUTH" "$dest_file"
     chmod 600 "$dest_file"
   else
@@ -1136,19 +1308,22 @@ cmd_save() {
   "token": {
     "access_token": "",
     "token_type": "Bearer",
-    "refresh_token": "$ref_token",
+    "refresh_token": "$source_ref",
     "expiry": ""
   }
 }
 EOF
     chmod 600 "$dest_file"
-    cp -p "$dest_file" "$TARGET_AUTH"
-    chmod 600 "$TARGET_AUTH"
+    if [[ ! -f "$TARGET_AUTH" ]]; then
+      cp -p "$dest_file" "$TARGET_AUTH"
+      chmod 600 "$TARGET_AUTH"
+    fi
   fi
 
-  write_acp_token "$ref_token" "$dest_file"
+  write_acp_token "$source_ref" "$dest_file"
   reload_acp_daemons "$new_name"
   echo -e "${C_GREEN}✔ Saved active session as '${C_BOLD}${new_name}${C_RESET}${C_GREEN}' (CLI & ACP).${C_RESET}"
+  sync_AUTHs_bg
 }
 
 sync_AUTHs() {
@@ -1502,7 +1677,8 @@ case "${1:-}" in
     cmd_status "$@"
     ;;
   whoami)
-    cmd_whoami
+    shift 2>/dev/null || true
+    cmd_whoami "$@"
     ;;
   swap)
     shift
