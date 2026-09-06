@@ -1570,12 +1570,26 @@ clean_cli() {
       fi
       echo -e "${C_GREEN}✔ Workspace permissions reset.${C_RESET}"
       ;;
+    acp)
+      echo -e "${C_DIM}Cleaning ACP conversations and databases...${C_RESET}"
+      local acp_dir
+      acp_dir="$(dirname "$TARGET_ACP_AUTH")"
+      rm -rf "$acp_dir"/conversations/* 2>/dev/null || true
+      local t3_base="$T3_USERDATA_DIR/providers/antigravity"
+      if [[ -d "$t3_base" ]]; then
+        for t3_inst in "$t3_base"/*; do
+          rm -rf "$t3_inst/antigravity-acp/conversations"/* 2>/dev/null || true
+        done
+      fi
+      echo -e "${C_GREEN}✔ Cleared ACP conversations.${C_RESET}"
+      ;;
     all)
       clean_cli chats -f
       clean_cli permissions -f
+      clean_cli acp -f
       ;;
     *)
-      echo -e "${C_RED}Error: invalid clean target '$target'. Options: chats, permissions, all${C_RESET}" >&2
+      echo -e "${C_RED}Error: invalid clean target '$target'. Options: chats, permissions, acp, all${C_RESET}" >&2
       return 1
       ;;
   esac
