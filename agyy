@@ -760,8 +760,9 @@ cmd_status() {
     acp_status="${C_DIM}none${C_RESET}"
   fi
 
-  local yolo_status
+  local yolo_status continue_status
   [[ -f "$YOLO_FILE" ]] && yolo_status="${C_GREEN}ON${C_RESET}" || yolo_status="${C_YELLOW}OFF${C_RESET}"
+  [[ -f "$CONTINUE_FILE" ]] && continue_status="${C_GREEN}ON${C_RESET}" || continue_status="${C_YELLOW}OFF${C_RESET}"
 
   local total_auths=0
   [[ -f "$USAGE_FILE" ]] && total_auths=$(grep -c . "$USAGE_FILE" 2>/dev/null || echo 0)
@@ -1638,6 +1639,36 @@ cmd_yolo() {
   esac
 }
 
+CONTINUE_FILE="$AUTH_DIR/.continue"
+
+cmd_continue() {
+  local action="${1:-toggle}"
+  case "$action" in
+    true)
+      touch "$CONTINUE_FILE"
+      echo -e "${C_BOLD}${C_GREEN}✔ Continue mode enabled${C_RESET} ${C_DIM}(-c active by default)${C_RESET}"
+      ;;
+    false)
+      rm -f "$CONTINUE_FILE"
+      echo -e "${C_BOLD}${C_YELLOW}✔ Continue mode disabled${C_RESET} ${C_DIM}(fresh sessions by default)${C_RESET}"
+      ;;
+    status)
+      if [[ -f "$CONTINUE_FILE" ]]; then
+        echo -e "${C_BOLD}${C_GREEN}Continue mode: ON${C_RESET} ${C_DIM}(-c active by default)${C_RESET}"
+      else
+        echo -e "${C_BOLD}${C_YELLOW}Continue mode: OFF${C_RESET} ${C_DIM}(fresh sessions by default)${C_RESET}"
+      fi
+      ;;
+    *)
+      if [[ -f "$CONTINUE_FILE" ]]; then
+        cmd_continue false
+      else
+        cmd_continue true
+      fi
+      ;;
+  esac
+}
+
 init_shell() {
   local bashrc="$HOME/.bashrc"
   local project_dir
@@ -1706,6 +1737,10 @@ case "${1:-}" in
     shift 2>/dev/null || true
     cmd_yolo "$@"
     ;;
+  continue)
+    shift 2>/dev/null || true
+    cmd_continue "$@"
+    ;;
   clean)
     shift
     clean_cli "$@"
@@ -1733,6 +1768,7 @@ case "${1:-}" in
     echo -e "  ${C_GREEN}delete${C_RESET} [name] [-r] [-f]       Delete profile (-r also revokes on Google)"
     echo -e "  ${C_GREEN}sync${C_RESET}                        Refresh live quotas from Google"
     echo -e "  ${C_GREEN}yolo${C_RESET} [true|false|status]     Toggle or set auto-approval of permissions"
+    echo -e "  ${C_GREEN}continue${C_RESET} [true|false|status] Toggle or set default session continuation (-c)"
     echo -e "  ${C_GREEN}clean${C_RESET} [chats|acp|all] [-f]     Clean CLI/ACP cache and session state"
     echo -e "  ${C_GREEN}reload-acp${C_RESET}                 Signal running ACP daemons to reload tokens"
     echo -e "  ${C_GREEN}sync-skills${C_RESET}                 Link ~/.agents/skills to CLI folder"
