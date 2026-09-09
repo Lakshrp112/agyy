@@ -1367,16 +1367,28 @@ def fetch_single_auth(fpath):
     access_token = token_obj.get('access_token') or data.get('access_token')
     refresh_token = token_obj.get('refresh_token') or data.get('refresh_token')
 
+    project_id = data.get('project_id') or 'aicode-consumers'
     def call_api(at):
         headers = {'Authorization': f'Bearer {at}', 'Content-Type': 'application/json', 'User-Agent': 'antigravity-cli'}
-        req = urllib.request.Request(
-            'https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels',
-            data=b'{}',
-            headers=headers,
-            method='POST'
-        )
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            return json.loads(resp.read().decode())
+        payload = json.dumps({'project': project_id}).encode()
+        try:
+            req = urllib.request.Request(
+                'https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels',
+                data=payload,
+                headers=headers,
+                method='POST'
+            )
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                return json.loads(resp.read().decode())
+        except Exception:
+            req = urllib.request.Request(
+                'https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels',
+                data=b'{}',
+                headers=headers,
+                method='POST'
+            )
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                return json.loads(resp.read().decode())
 
     res = None
     if access_token:
@@ -1423,14 +1435,31 @@ def fetch_single_auth(fpath):
     claude_rem = 1.0; claude_reset = 0
     for mid, mcfg in models.items():
         qinfo = mcfg.get('quotaInfo', {})
-        rf = qinfo.get('remainingFraction', 1.0)
+        if not qinfo:
+            continue
+        rf = qinfo.get('remainingFraction')
+        if rf is None:
+            rf = 0.0 if 'resetTime' in qinfo else 1.0
+        else:
+            try:
+                rf = float(rf)
+            except Exception:
+                rf = 1.0
         rt = parse_iso(qinfo.get('resetTime'))
         if 'gemini' in mid:
-            gem_rem = min(gem_rem, rf)
-            if rt > gem_reset: gem_reset = rt
+            if rf < gem_rem:
+                gem_rem = rf
+                gem_reset = rt
+            elif rf == gem_rem and rt > gem_reset:
+                gem_reset = rt
         elif 'claude' in mid:
-            claude_rem = min(claude_rem, rf)
-            if rt > claude_reset: claude_reset = rt    return name, {'gem_rem': gem_rem, 'gem_reset': gem_reset, 'claude_rem': claude_rem, 'claude_reset': claude_reset}
+            if rf < claude_rem:
+                claude_rem = rf
+                claude_reset = rt
+            elif rf == claude_rem and rt > claude_reset:
+                claude_reset = rt
+
+    return name, {'gem_rem': gem_rem, 'gem_reset': gem_reset, 'claude_rem': claude_rem, 'claude_reset': claude_reset}
 
 existing = {}
 if os.path.exists(usage_file):
