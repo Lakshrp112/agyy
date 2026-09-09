@@ -21,11 +21,12 @@ _agy_extension_completion() {
         cword=$COMP_CWORD
     fi
 
-    local toys_cmds="status swap save delete whoami sync yolo clean sync-skills init help"
+    local toys_cmds="status swap save delete whoami sync yolo continue clean reload-acp reload sync-skills init help"
     local agy_flags="-y --yolo -c --continue -m --model -p --print -h --help"
     local models="Gemini Claude"
-    local clean_opts="chats all -f"
+    local clean_opts="chats conversations permissions acp all -f"
     local yolo_opts="true false status"
+    local continue_opts="true false status"
 
     case "$prev" in
         --model|-m)
@@ -40,8 +41,24 @@ _agy_extension_completion() {
             COMPREPLY=( $(compgen -W "${yolo_opts}" -- "$cur") )
             return 0
             ;;
-        delete|swap)
+        continue)
+            COMPREPLY=( $(compgen -W "${continue_opts}" -- "$cur") )
+            return 0
+            ;;
+        delete)
             COMPREPLY=( $(compgen -W "$(_agy_get_auth_profiles)" -- "$cur") )
+            return 0
+            ;;
+        status)
+            COMPREPLY=( $(compgen -W "$(_agy_get_auth_profiles) ${models}" -- "$cur") )
+            return 0
+            ;;
+        swap)
+            COMPREPLY=( $(compgen -W "$(_agy_get_auth_profiles) ${models} --cli --acp" -- "$cur") )
+            return 0
+            ;;
+        whoami)
+            COMPREPLY=( $(compgen -W "--cli --acp -s --short" -- "$cur") )
             return 0
             ;;
     esac
@@ -62,7 +79,7 @@ _agy_extension_completion() {
         fi
     done
 
-    if [[ "$subcmd" == "status" || "$subcmd" == "swap" ]]; then
+    if [[ "$subcmd" == "status" ]]; then
         local pos=$(( cword - subcmd_idx ))
         local auths
         auths=$(_agy_get_auth_profiles)
@@ -74,12 +91,40 @@ _agy_extension_completion() {
             COMPREPLY=( $(compgen -W "${models} ${auths}" -- "$cur") )
             return 0
         fi
+    elif [[ "$subcmd" == "swap" ]]; then
+        local pos=$(( cword - subcmd_idx ))
+        local auths
+        auths=$(_agy_get_auth_profiles)
+
+        if [[ "$cur" == -* ]]; then
+            COMPREPLY=( $(compgen -W "--cli --acp" -- "$cur") )
+            return 0
+        fi
+
+        if (( pos == 1 )); then
+            COMPREPLY=( $(compgen -W "${auths} ${models} --cli --acp" -- "$cur") )
+            return 0
+        elif (( pos == 2 )); then
+            COMPREPLY=( $(compgen -W "${models} ${auths} --cli --acp" -- "$cur") )
+            return 0
+        elif (( pos == 3 )); then
+            COMPREPLY=( $(compgen -W "--cli --acp ${models}" -- "$cur") )
+            return 0
+        fi
     elif [[ "$subcmd" == "delete" ]]; then
         if [[ "$cur" == -* ]]; then
             COMPREPLY=( $(compgen -W "-r --revoke -f --force -y" -- "$cur") )
         else
             COMPREPLY=( $(compgen -W "$(_agy_get_auth_profiles) -r --revoke -f --force" -- "$cur") )
         fi
+        return 0
+    elif [[ "$subcmd" == "save" ]]; then
+        if [[ "$cur" == -* ]]; then
+            COMPREPLY=( $(compgen -W "--acp --cli" -- "$cur") )
+            return 0
+        fi
+    elif [[ "$subcmd" == "whoami" ]]; then
+        COMPREPLY=( $(compgen -W "--cli --acp -s --short" -- "$cur") )
         return 0
     fi
 
