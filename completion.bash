@@ -45,22 +45,6 @@ _agy_extension_completion() {
             COMPREPLY=( $(compgen -W "${continue_opts}" -- "$cur") )
             return 0
             ;;
-        delete)
-            COMPREPLY=( $(compgen -W "$(_agy_get_auth_profiles)" -- "$cur") )
-            return 0
-            ;;
-        status)
-            COMPREPLY=( $(compgen -W "$(_agy_get_auth_profiles) ${models}" -- "$cur") )
-            return 0
-            ;;
-        swap)
-            COMPREPLY=( $(compgen -W "$(_agy_get_auth_profiles) ${models} --cli --acp" -- "$cur") )
-            return 0
-            ;;
-        whoami)
-            COMPREPLY=( $(compgen -W "--cli --acp -s --short" -- "$cur") )
-            return 0
-            ;;
     esac
 
     local subcmd=""

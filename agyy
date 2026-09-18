@@ -56,28 +56,32 @@ is_int() {
   [[ "$1" =~ ^[0-9]+$ ]]
 }
 
-parse_refresh() {
-  local str="$1" compact d h m seconds=0
-  compact=$(printf '%s' "$str" | tr -d '[:space:]')
-  if [[ "$compact" =~ ([0-9]+)d ]]; then
-    d=${BASH_REMATCH[1]}; seconds=$(( seconds + d * 86400 ))
-    compact=${compact/"${d}d"/}
-  fi
-  if [[ "$compact" =~ ([0-9]+)h ]]; then
-    h=${BASH_REMATCH[1]}; seconds=$(( seconds + h * 3600 ))
-    compact=${compact/"${h}h"/}
-  fi
-  if [[ "$compact" =~ ([0-9]+)m ]]; then
-    m=${BASH_REMATCH[1]}; seconds=$(( seconds + m * 60 ))
-  fi
-  printf '%d' "$seconds"
-}
-
 fmt_time() {
-  local t=$1 h m s
+  local t=$1 mode="${2:-std}" d h m s
   (( t < 0 )) && t=0
-  h=$(( t / 3600 )); m=$(( (t % 3600) / 60 )); s=$(( t % 60 ))
-  printf '%02dh%02dm%02ds' "$h" "$m" "$s"
+  if [[ "$mode" == "compact" ]]; then
+    if (( t >= 86400 )); then
+      d=$(( t / 86400 )); h=$(( (t % 86400) / 3600 ))
+      printf '%2dd%02dh' "$d" "$h"
+    elif (( t >= 3600 )); then
+      h=$(( t / 3600 )); m=$(( (t % 3600) / 60 ))
+      printf '%2dh%02dm' "$h" "$m"
+    else
+      m=$(( t / 60 )); s=$(( t % 60 ))
+      printf '%2dm%02ds' "$m" "$s"
+    fi
+  else
+    if (( t >= 86400 )); then
+      d=$(( t / 86400 )); h=$(( (t % 86400) / 3600 ))
+      printf '%2dd %02dh' "$d" "$h"
+    elif (( t >= 3600 )); then
+      h=$(( t / 3600 )); m=$(( (t % 3600) / 60 ))
+      printf '%2dh %02dm' "$h" "$m"
+    else
+      m=$(( t / 60 )); s=$(( t % 60 ))
+      printf '%2dm %02ds' "$m" "$s"
+    fi
+  fi
 }
 
 acquire_lock() {
@@ -111,28 +115,32 @@ AUTH_line() {
 read_fields() {
   SPLIT=()
   IFS="$DEL" read -r -a SPLIT <<< "$1"
-  while (( ${#SPLIT[@]} < 9 )); do SPLIT[${#SPLIT[@]}]=""; done
+  while (( ${#SPLIT[@]} < 13 )); do SPLIT[${#SPLIT[@]}]=""; done
+}
+
+get_token_field() {
+  local f="$1" key="$2"
+  [[ -f "$f" ]] || return 1
+  if command -v jq >/dev/null 2>&1; then
+    jq -r ".token.${key} // .${key} // (if .token and (\"${key}\" == \"access_token\" or \"${key}\" == \"token\") and (.token | type == \"string\") then .token else empty end) // empty" "$f" 2>/dev/null
+  else
+    sed -n -E "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"([^\"]*)\".*/\\1/p" "$f" | head -n1
+  fi
 }
 
 get_access_AUTH() {
-  local f="$1"
-  [[ -f "$f" ]] || return 1
-  command -v jq >/dev/null 2>&1 && jq -r '.token.access_token // .access_token // (if (.token | type) == "string" then .token else empty end) // empty' "$f" 2>/dev/null || \
-    sed -n -E 's/.*"(access_token|token)"[[:space:]]*:[[:space:]]*"(ya29\.[^"]*)".*/\2/p' "$f" | head -n1
+  local val
+  val=$(get_token_field "$1" "access_token")
+  [[ -n "$val" ]] && { printf '%s' "$val"; return 0; }
+  get_token_field "$1" "token"
 }
 
 get_expiry_AUTH() {
-  local f="$1"
-  [[ -f "$f" ]] || return 1
-  command -v jq >/dev/null 2>&1 && jq -r '.token.expiry // .expiry // empty' "$f" 2>/dev/null || \
-    sed -n 's/.*"expiry"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -n1
+  get_token_field "$1" "expiry"
 }
 
 get_refresh_AUTH() {
-  local f="$1"
-  [[ -f "$f" ]] || return 1
-  command -v jq >/dev/null 2>&1 && jq -r '.token.refresh_token // .refresh_token // empty' "$f" 2>/dev/null || \
-    sed -n 's/.*"refresh_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -n1
+  get_token_field "$1" "refresh_token"
 }
 
 write_acp_token() {
@@ -146,8 +154,7 @@ write_acp_token() {
 
   local tmp_file="$target_dir/.acp_token.tmp.$$"
 
-  if command -v python3 >/dev/null 2>&1; then
-    python3 - "$TARGET_ACP_AUTH" "$ref_token" "$src_or_acc" "$explicit_exp" "$tmp_file" << 'PYEOF'
+  python3 - "$TARGET_ACP_AUTH" "$ref_token" "$src_or_acc" "$explicit_exp" "$tmp_file" << 'PYEOF'
 import sys, json, os, urllib.request, urllib.parse, time, codecs
 from datetime import datetime, timezone
 
@@ -266,68 +273,6 @@ with open(tmp_file, 'w') as f:
     json.dump(data, f, indent=2)
     f.write('\n')
 PYEOF
-  elif command -v jq >/dev/null 2>&1; then
-    local base_json="{}"
-    [[ -f "$TARGET_ACP_AUTH" ]] && base_json=$(cat "$TARGET_ACP_AUTH" 2>/dev/null || echo "{}")
-    local acc_token=""
-    local expiry=""
-    if [[ -f "$src_or_acc" ]]; then
-      acc_token=$(get_access_AUTH "$src_or_acc" 2>/dev/null || true)
-      expiry=$(get_expiry_AUTH "$src_or_acc" 2>/dev/null || true)
-    elif [[ "$src_or_acc" == ya29.* ]]; then
-      acc_token="$src_or_acc"
-      expiry="$explicit_exp"
-    fi
-    local cid sec
-    cid=$(tr 'A-Za-z' 'N-ZA-Mn-za-m' <<< '1071006060591-gzuffva2u21yper235igbybwu4t403rc.nccf.tbbtyrhfrepbagrag.pbz')
-    sec=$(tr 'A-Za-z' 'N-ZA-Mn-za-m' <<< 'TBPFCK-X58SJE486YqYW1zYO8fKP4m6dQNs')
-    jq --arg rt "$ref_token" \
-       --arg at "$acc_token" \
-       --arg exp "$expiry" \
-       --arg cid "$cid" \
-       --arg sec "$sec" \
-       --arg uri "https://oauth2.googleapis.com/token" \
-       --arg pid "aicode-consumers" \
-       '.client_id = $cid |
-        .client_secret = $sec |
-        .refresh_token = $rt |
-        (if ($at | length) > 0 then .token = $at else . end) |
-        (if ($exp | length) > 0 then .expiry = $exp else . end) |
-        .token_uri = (.token_uri // $uri) |
-        .scopes = ["https://www.googleapis.com/auth/cloud-platform", "https://www.googleapis.com/auth/userinfo.email"] |
-        .project_id = (.project_id // $pid)' <<< "$base_json" > "$tmp_file"
-  else
-    # Pure Bash fallback
-    local cid sec
-    cid=$(tr 'A-Za-z' 'N-ZA-Mn-za-m' <<< '1071006060591-gzuffva2u21yper235igbybwu4t403rc.nccf.tbbtyrhfrepbagrag.pbz')
-    sec=$(tr 'A-Za-z' 'N-ZA-Mn-za-m' <<< 'TBPFCK-X58SJE486YqYW1zYO8fKP4m6dQNs')
-    local uri="https://oauth2.googleapis.com/token"
-    local pid="aicode-consumers"
-    local acc_token=""
-    local expiry=""
-    if [[ -f "$src_or_acc" ]]; then
-      acc_token=$(get_access_AUTH "$src_or_acc" 2>/dev/null || true)
-      expiry=$(get_expiry_AUTH "$src_or_acc" 2>/dev/null || true)
-    elif [[ "$src_or_acc" == ya29.* ]]; then
-      acc_token="$src_or_acc"
-      expiry="$explicit_exp"
-    fi
-    cat << EOF > "$tmp_file"
-{
-  "client_id": "$cid",
-  "client_secret": "$sec",
-  "refresh_token": "$ref_token",
-  "token": "$acc_token",
-  "expiry": "$expiry",
-  "token_uri": "$uri",
-  "scopes": [
-    "https://www.googleapis.com/auth/cloud-platform",
-    "https://www.googleapis.com/auth/userinfo.email"
-  ],
-  "project_id": "$pid"
-}
-EOF
-  fi
 
   chmod 600 "$tmp_file"
   mv -f "$tmp_file" "$TARGET_ACP_AUTH"
@@ -427,59 +372,77 @@ cmd_reload_acp() {
   echo -e "${C_GREEN}✔ ACP reload signal dispatched.${C_RESET}"
 }
 
-model_stat_calc() {
-  local q="$1" r="$2" u="$3" l="$4" now window_end
+bucket_calc() {
+  local q="$1" u="$2" r="$3" now
   now=$(date +%s)
-  is_int "$q" || q=0
+  is_int "$q" || q=-1
   is_int "$u" || u=0
-  is_int "$l" || l=0
-  window_end=$(( l + $(parse_refresh "$r") ))
-  W_WEND=$window_end
-  if (( now >= window_end )); then
-    W_EFF=0; W_LEFT=0; W_RESET=1
+  is_int "$r" || r=0
+
+  B_ACTIVE=0; B_EFF=0; B_LEFT=0; B_RESET=1; B_REVOKED=0; B_Q=$q; B_U=$u; B_R=$r
+  if (( q <= 0 )); then
+    return 0
+  fi
+  B_ACTIVE=1
+  if (( r >= 2000000000 )); then
+    B_REVOKED=1; B_EFF=$q; B_LEFT=9999999999; B_RESET=0
+    return 0
+  fi
+
+  if (( now >= r || u == 0 )); then
+    B_EFF=0; B_LEFT=0; B_RESET=1
   else
-    W_EFF=$u; W_LEFT=$(( window_end - now )); W_RESET=0
-  fi
-  if (( W_LEFT < 0 )); then
-    W_LEFT=0
-  fi
-  W_PCT=0
-  if (( q > 0 )); then
-    W_PCT=$(( W_EFF * 100 / q ))
-  fi
-  if (( W_PCT > 100 )); then
-    W_PCT=100
+    B_EFF=$u; B_LEFT=$(( r - now )); B_RESET=0
   fi
 }
 
 AUTH_stat() {
-  # Gemini (G)
-  model_stat_calc "${SPLIT[1]:-0}" "${SPLIT[2]:-$REFRESH}" "${SPLIT[3]:-0}" "${SPLIT[4]:-0}"
-  M_EFF_G=$W_EFF; M_LEFT_G=$W_LEFT; M_RESET_G=$W_RESET; M_PCT_G=$W_PCT
-  M_QUOTA_G="${SPLIT[1]:-0}"; M_U_G="${SPLIT[3]:-0}"; M_L_G="${SPLIT[4]:-0}"; M_R_G="${SPLIT[2]:-$REFRESH}"
-  M_WEND_G=$W_WEND
+  # Gemini 5h
+  bucket_calc "${SPLIT[1]:--1}" "${SPLIT[2]:-0}" "${SPLIT[3]:-0}"
+  G5_ACTIVE=$B_ACTIVE; G5_EFF=$B_EFF; G5_LEFT=$B_LEFT; G5_RESET=$B_RESET; G5_REVOKED=$B_REVOKED; G5_Q=$B_Q; G5_U=$B_U; G5_R=$B_R
 
-  # Claude (C)
-  model_stat_calc "${SPLIT[5]:-0}" "${SPLIT[6]:-$REFRESH}" "${SPLIT[7]:-0}" "${SPLIT[8]:-0}"
-  M_EFF_C=$W_EFF; M_LEFT_C=$W_LEFT; M_RESET_C=$W_RESET; M_PCT_C=$W_PCT
-  M_QUOTA_C="${SPLIT[5]:-0}"; M_U_C="${SPLIT[7]:-0}"; M_L_C="${SPLIT[8]:-0}"; M_R_C="${SPLIT[6]:-$REFRESH}"
-  M_WEND_C=$W_WEND
+  # Gemini Weekly
+  bucket_calc "${SPLIT[4]:--1}" "${SPLIT[5]:-0}" "${SPLIT[6]:-0}"
+  GW_ACTIVE=$B_ACTIVE; GW_EFF=$B_EFF; GW_LEFT=$B_LEFT; GW_RESET=$B_RESET; GW_REVOKED=$B_REVOKED; GW_Q=$B_Q; GW_U=$B_U; GW_R=$B_R
+
+  # Claude 5h
+  bucket_calc "${SPLIT[7]:--1}" "${SPLIT[8]:-0}" "${SPLIT[9]:-0}"
+  C5_ACTIVE=$B_ACTIVE; C5_EFF=$B_EFF; C5_LEFT=$B_LEFT; C5_RESET=$B_RESET; C5_REVOKED=$B_REVOKED; C5_Q=$B_Q; C5_U=$B_U; C5_R=$B_R
+
+  # Claude Weekly
+  bucket_calc "${SPLIT[10]:--1}" "${SPLIT[11]:-0}" "${SPLIT[12]:-0}"
+  CW_ACTIVE=$B_ACTIVE; CW_EFF=$B_EFF; CW_LEFT=$B_LEFT; CW_RESET=$B_RESET; CW_REVOKED=$B_REVOKED; CW_Q=$B_Q; CW_U=$B_U; CW_R=$B_R
+
+  # Combined Model Health:
+  # Gemini:
+  M_HEALTH_G=1; M_BLOCKED_G=0; M_LEFT_G=0
+  if (( G5_REVOKED == 1 || GW_REVOKED == 1 )); then
+    M_HEALTH_G=0; M_BLOCKED_G=1; M_LEFT_G=9999999999
+  elif (( GW_ACTIVE == 1 && GW_EFF >= GW_Q )); then
+    M_HEALTH_G=0; M_BLOCKED_G=1; M_LEFT_G=$GW_LEFT
+  elif (( G5_ACTIVE == 1 && G5_EFF >= G5_Q )); then
+    M_HEALTH_G=0; M_BLOCKED_G=1; M_LEFT_G=$G5_LEFT
+  fi
+
+  # Claude:
+  M_HEALTH_C=1; M_BLOCKED_C=0; M_LEFT_C=0
+  if (( C5_REVOKED == 1 || CW_REVOKED == 1 )); then
+    M_HEALTH_C=0; M_BLOCKED_C=1; M_LEFT_C=9999999999
+  elif (( CW_ACTIVE == 1 && CW_EFF >= CW_Q )); then
+    M_HEALTH_C=0; M_BLOCKED_C=1; M_LEFT_C=$CW_LEFT
+  elif (( C5_ACTIVE == 1 && C5_EFF >= C5_Q )); then
+    M_HEALTH_C=0; M_BLOCKED_C=1; M_LEFT_C=$C5_LEFT
+  fi
+
+  M_EFF_TOTAL=$(( (G5_EFF > GW_EFF ? G5_EFF : GW_EFF) + (C5_EFF > CW_EFF ? C5_EFF : CW_EFF) ))
+  M_U_TOTAL=$(( G5_U + GW_U + C5_U + CW_U ))
 }
 
-usage_field() {
-  local u="$1" q="$2" pct=0 w=20 filled i bar="["
-  if (( q > 0 )); then
-    pct=$(( u * 100 / q ))
-  fi
-  if (( pct > 100 )); then
-    pct=100
-  fi
-  if (( pct < 0 )); then
-    pct=0
-  fi
+usage_bar() {
+  local pct="$1" w="${2:-10}" filled i bar="[" color=""
+  (( pct < 0 )) && pct=0
+  (( pct > 100 )) && pct=100
   filled=$(( pct * w / 100 ))
-  
-  local color=""
   if (( pct >= 80 )); then
     color="${C_RED}"
   elif (( pct >= 50 )); then
@@ -487,7 +450,6 @@ usage_field() {
   else
     color="${C_GREEN}"
   fi
-
   for ((i = 0; i < w; i++)); do
     if (( i < filled )); then 
       bar+="${color}#${C_RESET}"
@@ -496,7 +458,78 @@ usage_field() {
     fi
   done
   bar+="]"
-  printf '%s %03d%%' "$bar" "$pct"
+  printf '%s' "$bar"
+}
+
+bucket_cell() {
+  local q="$1" u="$2" r="$3" mode="${4:-wide}" bar_w="${5:-}"
+  is_int "$q" || q=-1
+  is_int "$u" || u=0
+  is_int "$r" || r=0
+  if (( q <= 0 )); then
+    return
+  fi
+  if [[ "$mode" == "compact" ]]; then
+    is_int "$bar_w" || bar_w=6
+    if (( r >= 2000000000 )); then
+      local bar
+      bar=$(usage_bar 100 "$bar_w")
+      printf "%s 100%% %s000/%-3d%s ${C_RED}REVOKD${C_RESET}" \
+        "$bar" "${C_RED}" "$q" "${C_RESET}"
+      return
+    fi
+    local now pct left bar left_color cd_str
+    now=$(date +%s)
+    pct=0
+    (( q > 0 )) && pct=$(( u * 100 / q ))
+    (( pct > 100 )) && pct=100
+    left=$(( q - u ))
+    (( left < 0 )) && left=0
+
+    bar=$(usage_bar "$pct" "$bar_w")
+
+    left_color="${C_GREEN}"
+    (( left < 20 )) && left_color="${C_RED}" || { (( left < 50 )) && left_color="${C_YELLOW}"; }
+
+    if (( r <= now || u == 0 )); then
+      cd_str="${C_BRIGHT_GREEN} READY${C_RESET}"
+    else
+      cd_str="${C_YELLOW}$(fmt_time "$(( r - now ))" compact)${C_RESET}"
+    fi
+
+    printf "%s %03d%% %s%03d/%-3d%s %s" \
+      "$bar" "$pct" "$left_color" "$left" "$q" "${C_RESET}" "$cd_str"
+  else
+    is_int "$bar_w" || bar_w=18
+    if (( r >= 2000000000 )); then
+      local bar
+      bar=$(usage_bar 100 "$bar_w")
+      printf "%s 100%%  %s000 / %-3d%s  ${C_RED}REVOKED${C_RESET}" \
+        "$bar" "${C_RED}" "$q" "${C_RESET}"
+      return
+    fi
+    local now pct left bar left_color cd_str
+    now=$(date +%s)
+    pct=0
+    (( q > 0 )) && pct=$(( u * 100 / q ))
+    (( pct > 100 )) && pct=100
+    left=$(( q - u ))
+    (( left < 0 )) && left=0
+
+    bar=$(usage_bar "$pct" "$bar_w")
+
+    left_color="${C_GREEN}"
+    (( left < 20 )) && left_color="${C_RED}" || { (( left < 50 )) && left_color="${C_YELLOW}"; }
+
+    if (( r <= now || u == 0 )); then
+      cd_str="${C_BRIGHT_GREEN} READY ${C_RESET}"
+    else
+      cd_str="${C_YELLOW}$(fmt_time "$(( r - now ))" std)${C_RESET}"
+    fi
+
+    printf "%s %03d%%  %s%03d / %-3d%s  %s" \
+      "$bar" "$pct" "$left_color" "$left" "$q" "${C_RESET}" "$cd_str"
+  fi
 }
 
 cmd_whoami() {
@@ -767,74 +800,90 @@ cmd_status() {
   local total_auths=0
   [[ -f "$USAGE_FILE" ]] && total_auths=$(grep -c . "$USAGE_FILE" 2>/dev/null || echo 0)
 
-  local now line name tmp
-  now=$(date +%s)
+  local max_name_w=12
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" ]] && continue
+    read_fields "$line"
+    local n="${SPLIT[0]}"
+    local l=${#n}
+    if [[ "$n" == "$active_name" && "$active_name" == "$acp_name" ]]; then
+      l=$(( l + 9 ))
+    elif [[ "$n" == "$active_name" || "$n" == "$acp_name" ]]; then
+      l=$(( l + 6 ))
+    fi
+    (( l > max_name_w )) && max_name_w=$l
+  done < "$USAGE_FILE"
+
+  local line name tmp
   tmp=$(mktemp)
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ -z "$line" ]] && continue
     read_fields "$line"
     name="${SPLIT[0]}"
     AUTH_stat
-    local blocked_count=0
-    local kg=$now
-    if (( M_L_G >= 2000000000 )); then
-      kg=$M_L_G
-      blocked_count=$(( blocked_count + 1 ))
-    elif (( M_EFF_G >= M_QUOTA_G )); then
-      kg=$M_WEND_G
-      if (( M_RESET_G == 1 || now >= M_WEND_G )); then
-        kg=$now
+
+    local key=0
+    # Tier 0: Active CLI profile pinned at row 1
+    if [[ -n "$active_name" && "$name" == "$active_name" ]]; then
+      key=0
+    # Tier 0.5: Active ACP profile (if distinct) pinned at row 2
+    elif [[ -n "$acp_name" && "$name" == "$acp_name" ]]; then
+      key=1
+    elif [[ -n "$filter_model" ]]; then
+      # Model-filtered sorting
+      local m_blk=0 m_left=0 m_rev=0 m_eff=0 m_q=100
+      if [[ "$filter_model" == "Gemini" ]]; then
+        m_blk=$M_BLOCKED_G; m_left=$M_LEFT_G
+        (( G5_REVOKED == 1 || GW_REVOKED == 1 )) && m_rev=1
+        m_eff=$(( G5_EFF > GW_EFF ? G5_EFF : GW_EFF ))
+        (( GW_Q > 0 )) && m_q=$GW_Q
       else
-        blocked_count=$(( blocked_count + 1 ))
+        m_blk=$M_BLOCKED_C; m_left=$M_LEFT_C
+        (( C5_REVOKED == 1 || CW_REVOKED == 1 )) && m_rev=1
+        m_eff=$(( C5_EFF > CW_EFF ? C5_EFF : CW_EFF ))
+        (( CW_Q > 0 )) && m_q=$CW_Q
       fi
-    fi
-    local kc=$now
-    if (( M_L_C >= 2000000000 )); then
-      kc=$M_L_C
-      blocked_count=$(( blocked_count + 1 ))
-    elif (( M_EFF_C >= M_QUOTA_C )); then
-      kc=$M_WEND_C
-      if (( M_RESET_C == 1 || now >= M_WEND_C )); then
-        kc=$now
+      if (( m_rev == 1 )); then
+        key=9999999999
+      elif (( m_blk == 1 )); then
+        key=$(( 3000000000 + m_left ))
       else
-        blocked_count=$(( blocked_count + 1 ))
+        local pct=$(( m_eff * 100 / m_q ))
+        key=$(( 100000000 + pct * 1000 ))
       fi
-    fi
-    local key=$now
-    if (( blocked_count == 1 )); then
-      local blocked_time=$kg
-      if (( kc > kg )); then
-        blocked_time=$kc
-      fi
-      key=$(( 1000000000 + blocked_time ))
-    elif (( blocked_count == 2 )); then
-      local first_reset=$kg
-      if (( kc < kg )); then
-        first_reset=$kc
-      fi
-      key=$(( 2000000000 + first_reset ))
-    fi
-    local rstr_g rstr_c
-    if (( M_L_G >= 2000000000 )); then
-      rstr_g="${C_RED}REVOKED${C_RESET}"
-    elif (( M_RESET_G == 1 )); then
-      rstr_g="${C_BRIGHT_GREEN}READY${C_RESET}"
     else
-      rstr_g="${C_YELLOW}$(fmt_time "$M_LEFT_G")${C_RESET}"
+      # General sorting (all models):
+      local is_revoked=0
+      (( G5_REVOKED == 1 || GW_REVOKED == 1 || C5_REVOKED == 1 || CW_REVOKED == 1 )) && is_revoked=1
+
+      if (( is_revoked == 1 )); then
+        key=9999999999
+      elif (( M_BLOCKED_G == 1 && M_BLOCKED_C == 1 )); then
+        # Tier 3: Both blocked -> sort ascending by earliest recovery
+        local earliest=$M_LEFT_G
+        (( M_LEFT_C < earliest )) && earliest=$M_LEFT_C
+        key=$(( 4000000000 + earliest ))
+      elif (( M_BLOCKED_G == 1 || M_BLOCKED_C == 1 )); then
+        # Tier 2: 1 model ready, 1 blocked -> sort ascending by soonest recovery of blocked model
+        local cd=$M_LEFT_G
+        (( M_BLOCKED_C == 1 )) && cd=$M_LEFT_C
+        key=$(( 2000000000 + cd ))
+      else
+        # Tier 1: Both models ready -> sort ascending by lowest usage (freshest first)
+        local u_g=$(( G5_EFF > GW_EFF ? G5_EFF : GW_EFF ))
+        local u_c=$(( C5_EFF > CW_EFF ? C5_EFF : CW_EFF ))
+        local max_pct=$(( u_g > u_c ? u_g : u_c ))
+        local avg_pct=$(( (u_g + u_c) / 2 ))
+        key=$(( 100000000 + max_pct * 1000 + avg_pct ))
+      fi
     fi
 
-    if (( M_L_C >= 2000000000 )); then
-      rstr_c="${C_RED}REVOKED${C_RESET}"
-    elif (( M_RESET_C == 1 )); then
-      rstr_c="${C_BRIGHT_GREEN}READY${C_RESET}"
-    else
-      rstr_c="${C_YELLOW}$(fmt_time "$M_LEFT_C")${C_RESET}"
-    fi
-
-    printf '%d\t%s\tGemini\t%d\t%d\t%s\t%s\tClaude\t%d\t%d\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$key" "$name" \
-      "$M_EFF_G" "$M_QUOTA_G" "$rstr_g" "$M_R_G" \
-      "$M_EFF_C" "$M_QUOTA_C" "$rstr_c" "$M_R_C" >> "$tmp"
+      "${SPLIT[1]:--1}" "${SPLIT[2]:-0}" "${SPLIT[3]:-0}" \
+      "${SPLIT[4]:--1}" "${SPLIT[5]:-0}" "${SPLIT[6]:-0}" \
+      "${SPLIT[7]:--1}" "${SPLIT[8]:-0}" "${SPLIT[9]:-0}" \
+      "${SPLIT[10]:--1}" "${SPLIT[11]:-0}" "${SPLIT[12]:-0}" >> "$tmp"
   done < "$USAGE_FILE"
 
   if [[ ! -s "$tmp" ]]; then
@@ -854,10 +903,62 @@ cmd_status() {
 
   echo -e "  ${C_BOLD}${C_CYAN}Antigravity Auth Pool${C_RESET} ${C_DIM}|${C_RESET} ${header_active} ${C_DIM}|${C_RESET} YOLO: ${yolo_status} ${C_DIM}|${C_RESET} CONT: ${continue_status} ${C_DIM}|${C_RESET} Profiles: ${C_BOLD}${total_auths}${C_RESET}\n"
 
+  local term_cols="${AGY_COLS:-${COLUMNS:-}}"
+  if [[ -z "$term_cols" ]]; then
+    term_cols=$(tput cols 2>/dev/null || true)
+  fi
+  is_int "$term_cols" || term_cols=120
+
+  local mode="compact" auth_w=$(( max_name_w + 1 )) show_5h=1 bar_w=6 col_w=28 div_w=80 divider
+  if (( term_cols >= 115 )); then
+    mode="wide"
+    (( auth_w < 16 )) && auth_w=16
+    local overhead=$(( 4 + auth_w + 1 + 8 + 1 + 4 )) # marker(4) + auth_w + space(1) + model(8) + space(1) + divider(4)
+    local avail=$(( (term_cols - overhead) / 2 ))
+    bar_w=$(( avail - 27 ))
+    (( bar_w > 26 )) && bar_w=26
+    (( bar_w < 10 )) && bar_w=10
+    col_w=$(( bar_w + 27 ))
+    div_w=$(( overhead + col_w * 2 ))
+  elif (( term_cols >= 75 )); then
+    mode="compact"
+    (( auth_w < 10 )) && auth_w=10
+    local overhead=$(( 3 + auth_w + 1 + 6 + 1 + 3 )) # marker(3) + auth_w + space(1) + model(6) + space(1) + divider(3)
+    local avail=$(( (term_cols - overhead) / 2 ))
+    bar_w=$(( avail - 22 ))
+    (( bar_w > 16 )) && bar_w=16
+    (( bar_w < 5 )) && bar_w=5
+    col_w=$(( bar_w + 22 ))
+    div_w=$(( overhead + col_w * 2 ))
+  else
+    # Sub-75 column terminals: show primary weekly window only to prevent wrap
+    mode="compact"
+    show_5h=0
+    (( auth_w < 10 )) && auth_w=10
+    local overhead=$(( 3 + auth_w + 1 + 6 + 1 )) # marker(3) + auth_w + space(1) + model(6) + space(1)
+    local avail=$(( term_cols - overhead ))
+    bar_w=$(( avail - 22 ))
+    (( bar_w > 14 )) && bar_w=14
+    (( bar_w < 4 )) && bar_w=4
+    col_w=$(( bar_w + 22 ))
+    div_w=$(( overhead + col_w ))
+  fi
+
+  divider=$(printf '%*s' "$div_w" '' | tr ' ' '-')
   local first=1
-  printf "  %-2s %-20s %-8s %-27s   %-11s %s${C_RESET}\n" "" "AUTH" "MODEL" "USAGE" "LEFT" "COOLDOWN"
-  echo -e "  ${C_DIM}--------------------------------------------------------------------------------------------${C_RESET}"
-  sort -n "$tmp" | while IFS=$'\t' read -r _ name m1 u1 q1 r1 rf1 m2 u2 q2 r2 rf2; do
+  if [[ "$mode" == "compact" ]]; then
+    if (( show_5h == 1 )); then
+      printf " %-1s %-*s %-6s %-*s | %-*s${C_RESET}\n" "" "$auth_w" "AUTH" "MODEL" "$col_w" "WEEKLY WINDOW" "$col_w" "5-HOUR WINDOW"
+    else
+      printf " %-1s %-*s %-6s %-*s${C_RESET}\n" "" "$auth_w" "AUTH" "MODEL" "$col_w" "WEEKLY WINDOW"
+    fi
+    echo -e " ${C_DIM}${divider}${C_RESET}"
+  else
+    printf "  %-2s %-*s %-8s %-*s  | %-*s${C_RESET}\n" "" "$auth_w" "AUTH" "MODEL" "$col_w" "WEEKLY WINDOW" "$col_w" "5-HOUR WINDOW"
+    echo -e "  ${C_DIM}${divider}${C_RESET}"
+  fi
+
+  sort -k1,1n -k2,2 "$tmp" | while IFS=$'\t' read -r _ name qG5 uG5 rG5 qGW uGW rGW qC5 uC5 rC5 qCW uCW rCW; do
     if [[ -n "$filter_auth" && "$name" != "$filter_auth" ]]; then
       continue
     fi
@@ -868,59 +969,78 @@ cmd_status() {
       first=0
     fi
 
-    local marker="  "
+    local marker=" "
     local raw_text="$name"
     local name_display="${C_BOLD}${C_WHITE}${name}${C_RESET}"
 
     if [[ -n "$active_name" && "$active_name" == "$acp_name" && "$name" == "$active_name" ]]; then
-      marker="${C_BRIGHT_GREEN}●${C_RESET} "
+      marker="${C_BRIGHT_GREEN}●${C_RESET}"
       raw_text="${name} (active)"
       name_display="${C_BOLD}${C_BRIGHT_GREEN}${name} (active)${C_RESET}"
     elif [[ "$name" == "$active_name" ]]; then
-      marker="${C_GREEN}●${C_RESET} "
+      marker="${C_GREEN}●${C_RESET}"
       raw_text="${name} (cli)"
       name_display="${C_BOLD}${C_GREEN}${name} (cli)${C_RESET}"
     elif [[ "$name" == "$acp_name" ]]; then
-      marker="${C_YELLOW}◆${C_RESET} "
+      marker="${C_YELLOW}◆${C_RESET}"
       raw_text="${name} (acp)"
       name_display="${C_BOLD}${C_YELLOW}${name} (acp)${C_RESET}"
     fi
 
-    local pad_len=$(( 20 - ${#raw_text} ))
+    local pad_len=$(( auth_w - ${#raw_text} ))
     (( pad_len < 1 )) && pad_len=1
     local pad
     pad=$(printf '%*s' "$pad_len" "")
 
-    local left1=$(( q1 - u1 ))
-    (( left1 < 0 )) && left1=0
-    local left2=$(( q2 - u2 ))
-    (( left2 < 0 )) && left2=0
+    local cell_g5 cell_gw cell_c5 cell_cw
+    cell_g5=$(bucket_cell "$qG5" "$uG5" "$rG5" "$mode" "$bar_w")
+    cell_gw=$(bucket_cell "$qGW" "$uGW" "$rGW" "$mode" "$bar_w")
+    cell_c5=$(bucket_cell "$qC5" "$uC5" "$rC5" "$mode" "$bar_w")
+    cell_cw=$(bucket_cell "$qCW" "$uCW" "$rCW" "$mode" "$bar_w")
 
-    local left_color1="${C_GREEN}"
-    (( left1 < 20 )) && left_color1="${C_RED}" || { (( left1 < 50 )) && left_color1="${C_YELLOW}"; }
-    local left_color2="${C_GREEN}"
-    (( left2 < 20 )) && left_color2="${C_RED}" || { (( left2 < 50 )) && left_color2="${C_YELLOW}"; }
+    if [[ "$mode" == "compact" ]]; then
+      local g5_disp="" c5_disp=""
+      if (( show_5h == 1 )); then
+        [[ -n "$cell_g5" ]] && g5_disp=" | ${cell_g5}"
+        [[ -n "$cell_c5" ]] && c5_disp=" | ${cell_c5}"
+      fi
 
-    if [[ -z "$filter_model" || "$filter_model" == "Gemini" ]]; then
-      printf "  %s%s%s %-8s %s   %s%03d / %-5d%s %s%s%s\n" \
-        "${marker}" "${name_display}" "${pad}" \
-        "${m1}" "$(usage_field "$u1" "$q1")" \
-        "${left_color1}" "$left1" "$q1" "${C_RESET}" \
-        "" "${r1}" ""
-    fi
-    if [[ -z "$filter_model" || "$filter_model" == "Claude" ]]; then
-      if [[ "$filter_model" == "Claude" ]]; then
-        printf "  %s%s%s %-8s %s   %s%03d / %-5d%s %s%s%s\n" \
+      if [[ -z "$filter_model" || "$filter_model" == "Gemini" ]]; then
+        printf " %s %s%s %-6s %s%s\n" \
           "${marker}" "${name_display}" "${pad}" \
-          "${m2}" "$(usage_field "$u2" "$q2")" \
-          "${left_color2}" "$left2" "$q2" "${C_RESET}" \
-          "" "${r2}" ""
-      else
-        printf "    %-20s %-8s %s   %s%03d / %-5d%s %s%s%s\n" \
-          "" \
-          "${m2}" "$(usage_field "$u2" "$q2")" \
-          "${left_color2}" "$left2" "$q2" "${C_RESET}" \
-          "" "${r2}" ""
+          "Gemini" "${cell_gw}" "${g5_disp}"
+      fi
+      if [[ -z "$filter_model" || "$filter_model" == "Claude" ]]; then
+        if [[ "$filter_model" == "Claude" ]]; then
+          printf " %s %s%s %-6s %s%s\n" \
+            "${marker}" "${name_display}" "${pad}" \
+            "Claude" "${cell_cw}" "${c5_disp}"
+        else
+          printf "   %-*s %-6s %s%s\n" \
+            "$auth_w" "" \
+            "Claude" "${cell_cw}" "${c5_disp}"
+        fi
+      fi
+    else
+      local g5_disp_w="" c5_disp_w=""
+      [[ -n "$cell_g5" ]] && g5_disp_w="  | ${cell_g5}"
+      [[ -n "$cell_c5" ]] && c5_disp_w="  | ${cell_c5}"
+
+      if [[ -z "$filter_model" || "$filter_model" == "Gemini" ]]; then
+        printf "  %s %s%s %-8s %s%s\n" \
+          "${marker}" "${name_display}" "${pad}" \
+          "Gemini" "${cell_gw}" "${g5_disp_w}"
+      fi
+      if [[ -z "$filter_model" || "$filter_model" == "Claude" ]]; then
+        if [[ "$filter_model" == "Claude" ]]; then
+          printf "  %s %s%s %-8s %s%s\n" \
+            "${marker}" "${name_display}" "${pad}" \
+            "Claude" "${cell_cw}" "${c5_disp_w}"
+        else
+          printf "    %-*s %-8s %s%s\n" \
+            "$auth_w" "" \
+            "Claude" "${cell_cw}" "${c5_disp_w}"
+        fi
       fi
     fi
   done
@@ -941,55 +1061,47 @@ pick_AUTH() {
     [[ -z "$line" ]] && continue
     read_fields "$line"
     AUTH_stat
-    local eff left u q r reset
-    local left_g=0
-    if (( M_EFF_G >= M_QUOTA_G )); then
-      left_g=$M_LEFT_G
-    fi
-    local left_c=0
-    if (( M_EFF_C >= M_QUOTA_C )); then
-      left_c=$M_LEFT_C
-    fi
-
+    local healthy=0 left=0 eff=0 u=0
     if [[ "$target_model" == "Gemini" ]]; then
-      eff=$M_EFF_G; left=$left_g; u=$M_U_G; q=$M_QUOTA_G; r=$M_R_G; reset=$M_RESET_G
+      healthy=$M_HEALTH_G
+      left=$M_LEFT_G
+      eff=$(( G5_EFF > GW_EFF ? G5_EFF : GW_EFF ))
+      u=$(( G5_U + GW_U ))
     elif [[ "$target_model" == "Claude" ]]; then
-      eff=$M_EFF_C; left=$left_c; u=$M_U_C; q=$M_QUOTA_C; r=$M_R_C; reset=$M_RESET_C
+      healthy=$M_HEALTH_C
+      left=$M_LEFT_C
+      eff=$(( C5_EFF > CW_EFF ? C5_EFF : CW_EFF ))
+      u=$(( C5_U + CW_U ))
     else
-      eff=$(( M_EFF_G + M_EFF_C ))
-      left=$left_g
-      if (( left_c > left )); then
-        left=$left_c
-      fi
-      u=$(( M_U_G + M_U_C ))
-      q=$(( M_QUOTA_G + M_QUOTA_C ))
-      r="$M_R_G"
-      reset=0
-      if (( M_RESET_G == 1 && M_RESET_C == 1 )); then
-        reset=1
-      fi
+      (( M_HEALTH_G == 1 && M_HEALTH_C == 1 )) && healthy=1
+      left=$M_LEFT_G
+      (( M_LEFT_C > left )) && left=$M_LEFT_C
+      eff=$M_EFF_TOTAL
+      u=$M_U_TOTAL
     fi
 
-    local is_healthy=0
-    if (( left == 0 )) && { (( q == 0 )) || (( eff < q )) || (( reset == 1 )); }; then
-      is_healthy=1
-    fi
-
-    if [[ -n "$preferred_profile" && "${SPLIT[0]}" == "$preferred_profile" && $is_healthy -eq 1 ]]; then
+    if [[ -n "$preferred_profile" && "${SPLIT[0]}" == "$preferred_profile" && $healthy -eq 1 ]]; then
       pref_found=1
       pref_name="${SPLIT[0]}"
     fi
 
     local is_better=0
-    if (( eff < best_eff )); then
+    if (( healthy == 1 && found == 0 )); then
       is_better=1
-    elif (( eff == best_eff )); then
-      if (( left < best_time )); then
+    elif (( healthy == 1 )); then
+      if (( eff < best_eff )); then
         is_better=1
-      elif (( left == 0 && best_time == 0 && u < best_u )); then
+      elif (( eff == best_eff )); then
+        if (( u < best_u )); then
+          is_better=1
+        fi
+      fi
+    elif (( found == 0 )); then
+      if (( left < best_time )); then
         is_better=1
       fi
     fi
+
     if (( is_better == 1 )); then
       best_name="${SPLIT[0]}"; best_eff=$eff; best_time=$left; found=1; best_u=$u
     fi
@@ -1109,21 +1221,19 @@ swap_AUTH() {
     return 1
   fi
 
-  if [[ "$target_scope" == "cli" ]]; then
+  if [[ "$target_scope" != "acp" ]]; then
     cp -p "$AUTH_file" "$TARGET_AUTH"
     chmod 600 "$TARGET_AUTH"
-    echo -e "${C_GREEN}✔ Switched active CLI profile to ${C_BOLD}${best_name}${C_RESET} ${C_DIM}(CLI only)${C_RESET}"
-  elif [[ "$target_scope" == "acp" ]]; then
-    write_acp_token "$ref_token" "$AUTH_file"
-    reload_acp_daemons "$best_name"
-    echo -e "${C_GREEN}✔ Switched active ACP profile to ${C_BOLD}${best_name}${C_RESET} ${C_DIM}(ACP only)${C_RESET}"
-  else
-    cp -p "$AUTH_file" "$TARGET_AUTH"
-    chmod 600 "$TARGET_AUTH"
-    write_acp_token "$ref_token" "$AUTH_file"
-    reload_acp_daemons "$best_name"
-    echo -e "${C_GREEN}✔ Switched active profile to ${C_BOLD}${best_name}${C_RESET} ${C_DIM}(CLI & ACP)${C_RESET}"
   fi
+  if [[ "$target_scope" != "cli" ]]; then
+    write_acp_token "$ref_token" "$AUTH_file"
+    reload_acp_daemons "$best_name"
+  fi
+
+  local scope_desc="CLI & ACP"
+  [[ "$target_scope" == "cli" ]] && scope_desc="CLI only"
+  [[ "$target_scope" == "acp" ]] && scope_desc="ACP only"
+  echo -e "${C_GREEN}✔ Switched active profile to ${C_BOLD}${best_name}${C_RESET} ${C_DIM}(${scope_desc})${C_RESET}"
   sync_AUTHs_bg
 }
 
@@ -1140,17 +1250,11 @@ prepare_AUTH() {
     read_fields "$(AUTH_line "$active_name")" || true
     AUTH_stat
     if [[ "$target_model" == "Gemini" ]]; then
-      if (( M_LEFT_G == 0 || M_EFF_G < M_QUOTA_G )); then
-        has_model=1
-      fi
+      (( M_HEALTH_G == 1 )) && has_model=1
     elif [[ "$target_model" == "Claude" ]]; then
-      if (( M_LEFT_C == 0 || M_EFF_C < M_QUOTA_C )); then
-        has_model=1
-      fi
+      (( M_HEALTH_C == 1 )) && has_model=1
     else
-      if (( (M_LEFT_G == 0 || M_EFF_G < M_QUOTA_G) && (M_LEFT_C == 0 || M_EFF_C < M_QUOTA_C) )); then
-        has_model=1
-      fi
+      (( M_HEALTH_G == 1 && M_HEALTH_C == 1 )) && has_model=1
     fi
   fi
 
@@ -1333,7 +1437,7 @@ sync_AUTHs() {
     return 0
   fi
   AUTH_DIR="$AUTH_DIR" USAGE_FILE="$USAGE_FILE" DEFAULT_QUOTA="$DEFAULT_QUOTA" REFRESH="$REFRESH" python3 - << 'PYEOF'
-import json, glob, urllib.request, urllib.parse, time, os, codecs
+import json, glob, urllib.request, urllib.parse, urllib.error, time, os, codecs, re
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 
@@ -1371,24 +1475,36 @@ def fetch_single_auth(fpath):
     def call_api(at):
         headers = {'Authorization': f'Bearer {at}', 'Content-Type': 'application/json', 'User-Agent': 'antigravity-cli'}
         payload = json.dumps({'project': project_id}).encode()
-        try:
-            req = urllib.request.Request(
-                'https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels',
-                data=payload,
-                headers=headers,
-                method='POST'
-            )
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                return json.loads(resp.read().decode())
-        except Exception:
-            req = urllib.request.Request(
-                'https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels',
-                data=b'{}',
-                headers=headers,
-                method='POST'
-            )
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                return json.loads(resp.read().decode())
+        endpoints = [
+            'https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary',
+            'https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary'
+        ]
+        for url in endpoints:
+            for attempt in range(2):
+                try:
+                    req = urllib.request.Request(url, data=payload, headers=headers, method='POST')
+                    with urllib.request.urlopen(req, timeout=8) as resp:
+                        return json.loads(resp.read().decode())
+                except urllib.error.HTTPError as e:
+                    if e.code in (401, 403):
+                        raise
+                    if attempt == 0 and e.code in (429, 500, 502, 503, 504):
+                        time.sleep(1)
+                        continue
+                    if attempt == 0:
+                        try:
+                            req_fb = urllib.request.Request(url, data=b'{}', headers=headers, method='POST')
+                            with urllib.request.urlopen(req_fb, timeout=8) as resp:
+                                return json.loads(resp.read().decode())
+                        except Exception:
+                            pass
+                    break
+                except Exception:
+                    if attempt == 0:
+                        time.sleep(1)
+                        continue
+                    break
+        return None
 
     res = None
     if access_token:
@@ -1397,7 +1513,7 @@ def fetch_single_auth(fpath):
         except Exception:
             pass
 
-    if not res and refresh_token:
+    if (not res or not res.get('groups')) and refresh_token:
         body = urllib.parse.urlencode({
             'client_id': client_id,
             'client_secret': client_secret,
@@ -1406,7 +1522,7 @@ def fetch_single_auth(fpath):
         }).encode()
         rreq = urllib.request.Request('https://oauth2.googleapis.com/token', data=body, method='POST')
         try:
-            with urllib.request.urlopen(rreq, timeout=6) as rresp:
+            with urllib.request.urlopen(rreq, timeout=8) as rresp:
                 rres = json.loads(rresp.read().decode())
                 new_at = rres.get('access_token')
                 if new_at:
@@ -1427,46 +1543,72 @@ def fetch_single_auth(fpath):
         except Exception:
             pass
 
-    if not res:
+    if not res or not res.get('groups'):
         return name, None
 
-    models = res.get('models', {})
-    gem_rem = 1.0; gem_reset = 0
-    claude_rem = 1.0; claude_reset = 0
-    for mid, mcfg in models.items():
-        qinfo = mcfg.get('quotaInfo', {})
-        if not qinfo:
-            continue
-        rf = qinfo.get('remainingFraction')
+    def classify_buckets(buckets):
+        if not buckets:
+            return None, None
+        def get_dur(b):
+            text = f"{b.get('window', '')} {b.get('bucketId', '')} {b.get('displayName', '')}".lower()
+            m = re.search(r'(\d+)\s*(?:h|hour)', text)
+            if m: return int(m.group(1)) * 3600
+            m = re.search(r'(\d+)\s*(?:d|day)', text)
+            if m: return int(m.group(1)) * 86400
+            if 'week' in text or 'wk' in text:
+                m = re.search(r'(\d+)\s*(?:w|week)', text)
+                return (int(m.group(1)) if m else 1) * 7 * 86400
+            if 'month' in text:
+                return 30 * 86400
+            rt = parse_iso(b.get('resetTime'))
+            if rt > 0:
+                diff = rt - int(time.time())
+                if diff > 0: return diff
+            return 7 * 86400
+
+        sorted_b = sorted(buckets, key=get_dur)
+        if len(sorted_b) == 1:
+            dur = get_dur(sorted_b[0])
+            if dur <= 24 * 3600:
+                return sorted_b[0], None
+            return None, sorted_b[0]
+        return sorted_b[0], sorted_b[-1]
+
+    def extract_bucket(b):
+        if not b:
+            return None, 0
+        rf = b.get('remainingFraction')
         if rf is None:
-            rf = 0.0 if 'resetTime' in qinfo else 1.0
+            rf = 0.0 if 'resetTime' in b else 1.0
         else:
-            try:
-                rf = float(rf)
-            except Exception:
-                rf = 1.0
-        rt = parse_iso(qinfo.get('resetTime'))
-        if 'gemini' in mid:
-            if rf < gem_rem:
-                gem_rem = rf
-                gem_reset = rt
-            elif rf == gem_rem and rt > gem_reset:
-                gem_reset = rt
-        elif 'claude' in mid:
-            if rf < claude_rem:
-                claude_rem = rf
-                claude_reset = rt
-            elif rf == claude_rem and rt > claude_reset:
-                claude_reset = rt
+            try: rf = float(rf)
+            except Exception: rf = 1.0
+        rt = parse_iso(b.get('resetTime'))
+        return rf, rt
 
-    return name, {'gem_rem': gem_rem, 'gem_reset': gem_reset, 'claude_rem': claude_rem, 'claude_reset': claude_reset}
+    data_out = {
+        'g5_rem': None, 'g5_reset': 0,
+        'gw_rem': None, 'gw_reset': 0,
+        'c5_rem': None, 'c5_reset': 0,
+        'cw_rem': None, 'cw_reset': 0,
+    }
+    for g in res.get('groups', []):
+        gname = g.get('displayName', '').lower()
+        is_gem = 'gemini' in gname
+        is_claude = 'claude' in gname or 'gpt' in gname or '3p' in g.get('description', '').lower()
+        b_short, b_long = classify_buckets(g.get('buckets', []))
+        if is_gem:
+            if b_short:
+                data_out['g5_rem'], data_out['g5_reset'] = extract_bucket(b_short)
+            if b_long:
+                data_out['gw_rem'], data_out['gw_reset'] = extract_bucket(b_long)
+        elif is_claude:
+            if b_short:
+                data_out['c5_rem'], data_out['c5_reset'] = extract_bucket(b_short)
+            if b_long:
+                data_out['cw_rem'], data_out['cw_reset'] = extract_bucket(b_long)
 
-existing = {}
-if os.path.exists(usage_file):
-    with open(usage_file, 'r') as f:
-        for line in f:
-            p = line.strip().split(',')
-            if p and p[0]: existing[p[0]] = p
+    return name, data_out
 
 files = sorted(glob.glob(os.path.join(auth_dir, 'antigravity-oauth-token-*')))
 with ThreadPoolExecutor(max_workers=max(1, len(files))) as pool:
@@ -1476,31 +1618,28 @@ out_lines = []
 now = int(time.time())
 for fpath in files:
     name = os.path.basename(fpath).replace('antigravity-oauth-token-', '')
-    orig = existing.get(name, [name, default_quota, default_refresh, '0', '0', default_quota, default_refresh, '0', '0'])
-    while len(orig) < 9: orig.append('0')
-    qG, rG = orig[1] or default_quota, orig[2] or default_refresh
-    qC, rC = orig[5] or default_quota, orig[6] or default_refresh
-    uG, lG = orig[3] or '0', orig[4] or '0'
-    uC, lC = orig[7] or '0', orig[8] or '0'
-
     q = fetched.get(name)
     if q is not None:
-        uG = str(int(round((1.0 - q['gem_rem']) * int(qG))))
-        if q['gem_reset'] > now and int(uG) > 0:
-            lG = str(q['gem_reset'] - 604800)
-        else:
-            lG = '0'
+        def proc_bucket(rem, reset):
+            if rem is None:
+                return '-1', '0', '0'
+            q_val = default_quota
+            u_int = int(round((1.0 - rem) * int(q_val)))
+            if rem < 1.0 and u_int == 0:
+                u_int = 1
+            return str(q_val), str(u_int), str(reset)
 
-        uC = str(int(round((1.0 - q['claude_rem']) * int(qC))))
-        if q['claude_reset'] > now and int(uC) > 0:
-            lC = str(q['claude_reset'] - 604800)
-        else:
-            lC = '0'
+        qG5, uG5, rG5 = proc_bucket(q['g5_rem'], q['g5_reset'])
+        qGW, uGW, rGW = proc_bucket(q['gw_rem'], q['gw_reset'])
+        qC5, uC5, rC5 = proc_bucket(q['c5_rem'], q['c5_reset'])
+        qCW, uCW, rCW = proc_bucket(q['cw_rem'], q['cw_reset'])
     else:
-        uG = qG; lG = '9999999999'
-        uC = qC; lC = '9999999999'
+        qG5, uG5, rG5 = default_quota, default_quota, '9999999999'
+        qGW, uGW, rGW = default_quota, default_quota, '9999999999'
+        qC5, uC5, rC5 = default_quota, default_quota, '9999999999'
+        qCW, uCW, rCW = default_quota, default_quota, '9999999999'
 
-    out_lines.append(f"{name},{qG},{rG},{uG},{lG},{qC},{rC},{uC},{lC}\n")
+    out_lines.append(f"{name},{qG5},{uG5},{rG5},{qGW},{uGW},{rGW},{qC5},{uC5},{rC5},{qCW},{uCW},{rCW}\n")
 
 tmp_usage = usage_file + '.tmp'
 with open(tmp_usage, 'w') as f:
@@ -1551,11 +1690,11 @@ prompt_stop_agy() {
     read -p "Would you like to stop 'agy' and ${action_desc}? (y/N): " -r answer || answer="n"
     if [[ "$answer" =~ ^[Yy]$ ]]; then
       echo -e "${C_DIM}Stopping 'agy' process(es)...${C_RESET}"
-      kill $(pgrep -x agy) 2>/dev/null || true
+      pkill -x "agy" 2>/dev/null || true
       sleep 1
       if pgrep -x "agy" >/dev/null 2>&1; then
         echo -e "${C_YELLOW}Warning: Some 'agy' process(es) did not stop. Attempting force kill...${C_RESET}"
-        kill -9 $(pgrep -x agy) 2>/dev/null || true
+        pkill -9 -x "agy" 2>/dev/null || true
         sleep 0.5
       fi
     else
