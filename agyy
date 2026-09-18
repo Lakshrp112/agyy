@@ -1050,70 +1050,96 @@ cmd_status() {
 pick_AUTH() {
   local target_model="${1:-}"
   local preferred_profile="${2:-}"
-  local line found=0
-  best_name=""; best_eff=999999; best_time=999999999; best_u=999999
-  local pref_found=0 pref_name=""
+  local exclude_profile="${3:-}"
+  local line
+  best_name=""; best_tier=0; best_eff=999999; best_u=999999
+  local fallback_name="" fallback_tier=0 fallback_eff=999999 fallback_u=999999
+
   if [[ ! -s "$USAGE_FILE" ]]; then
     echo -e "${C_RED}No auths available.${C_RESET}" >&2
     return 1
   fi
+
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ -z "$line" ]] && continue
     read_fields "$line"
+    local name="${SPLIT[0]}"
     AUTH_stat
-    local healthy=0 left=0 eff=0 u=0
+
+    local tier=0 eff=0 u=0
     if [[ "$target_model" == "Gemini" ]]; then
-      healthy=$M_HEALTH_G
-      left=$M_LEFT_G
-      eff=$(( G5_EFF > GW_EFF ? G5_EFF : GW_EFF ))
-      u=$(( G5_U + GW_U ))
+      if (( M_HEALTH_G == 1 )); then
+        tier=1
+        eff=$(( G5_EFF > GW_EFF ? G5_EFF : GW_EFF ))
+        u=$(( G5_U + GW_U ))
+      fi
     elif [[ "$target_model" == "Claude" ]]; then
-      healthy=$M_HEALTH_C
-      left=$M_LEFT_C
-      eff=$(( C5_EFF > CW_EFF ? C5_EFF : CW_EFF ))
-      u=$(( C5_U + CW_U ))
+      if (( M_HEALTH_C == 1 )); then
+        tier=1
+        eff=$(( C5_EFF > CW_EFF ? C5_EFF : CW_EFF ))
+        u=$(( C5_U + CW_U ))
+      fi
     else
-      (( M_HEALTH_G == 1 && M_HEALTH_C == 1 )) && healthy=1
-      left=$M_LEFT_G
-      (( M_LEFT_C > left )) && left=$M_LEFT_C
-      eff=$M_EFF_TOTAL
-      u=$M_U_TOTAL
+      # General swap: prioritize profiles with both models ready, then Gemini ready, then Claude ready
+      if (( M_HEALTH_G == 1 && M_HEALTH_C == 1 )); then
+        tier=3
+        eff=$M_EFF_TOTAL
+        u=$M_U_TOTAL
+      elif (( M_HEALTH_G == 1 )); then
+        tier=2
+        eff=$(( G5_EFF > GW_EFF ? G5_EFF : GW_EFF ))
+        u=$(( G5_U + GW_U ))
+      elif (( M_HEALTH_C == 1 )); then
+        tier=1
+        eff=$(( C5_EFF > CW_EFF ? C5_EFF : CW_EFF ))
+        u=$(( C5_U + CW_U ))
+      fi
     fi
 
-    if [[ -n "$preferred_profile" && "${SPLIT[0]}" == "$preferred_profile" && $healthy -eq 1 ]]; then
-      pref_found=1
-      pref_name="${SPLIT[0]}"
-    fi
+    # Zero available usage on target/any model -> strictly ineligible
+    (( tier == 0 )) && continue
 
     local is_better=0
-    if (( healthy == 1 && found == 0 )); then
+    if (( tier > best_tier )); then
       is_better=1
-    elif (( healthy == 1 )); then
+    elif (( tier == best_tier )); then
       if (( eff < best_eff )); then
         is_better=1
-      elif (( eff == best_eff )); then
-        if (( u < best_u )); then
-          is_better=1
-        fi
-      fi
-    elif (( found == 0 )); then
-      if (( left < best_time )); then
+      elif (( eff == best_eff && u < best_u )); then
         is_better=1
       fi
+    fi
+
+    # Track best fallback in case all candidates are excluded
+    if [[ -z "$fallback_name" || $tier -gt $fallback_tier || ($tier -eq $fallback_tier && $eff -lt $fallback_eff) ]]; then
+      fallback_name="$name"; fallback_tier=$tier; fallback_eff=$eff; fallback_u=$u
+    fi
+
+    if [[ -n "$exclude_profile" && "$name" == "$exclude_profile" ]]; then
+      continue
+    fi
+
+    if [[ -n "$preferred_profile" && "$name" == "$preferred_profile" ]]; then
+      best_name="$name"; best_tier=99; best_eff=$eff; best_u=$u
+      continue
     fi
 
     if (( is_better == 1 )); then
-      best_name="${SPLIT[0]}"; best_eff=$eff; best_time=$left; found=1; best_u=$u
+      best_name="$name"; best_tier=$tier; best_eff=$eff; best_u=$u
     fi
   done < "$USAGE_FILE"
-  if (( pref_found == 1 )); then
-    best_name="$pref_name"
-    found=1
+
+  if [[ -z "$best_name" && -n "$fallback_name" ]]; then
+    best_name="$fallback_name"
   fi
-  if (( found == 0 )); then
-    echo -e "${C_RED}No suitable auth found.${C_RESET}" >&2
+
+  if [[ -z "$best_name" ]]; then
+    local target_desc="any model"
+    [[ -n "$target_model" ]] && target_desc="$target_model"
+    echo -e "${C_RED}Error: no profiles with available quota found for ${target_desc}.${C_RESET}" >&2
     return 1
   fi
+
   return 0
 }
 
@@ -1192,6 +1218,10 @@ swap_AUTH() {
     esac
   done
 
+  local active_cli active_acp
+  active_cli=$(find_active_AUTH 2>/dev/null || true)
+  active_acp=$(find_active_acp_AUTH 2>/dev/null || true)
+
   if [[ -n "$desired_auth" ]]; then
     read_fields "$(AUTH_line "$desired_auth")" || true
     if [[ -z "${SPLIT[0]}" ]]; then
@@ -1199,14 +1229,40 @@ swap_AUTH() {
       return 1
     fi
     best_name="${SPLIT[0]}"
-  else
-    local preferred_profile=""
-    if [[ "$target_scope" == "cli" ]]; then
-      preferred_profile=$(find_active_acp_AUTH 2>/dev/null || true)
-    elif [[ "$target_scope" == "acp" ]]; then
-      preferred_profile=$(find_active_AUTH 2>/dev/null || true)
+    AUTH_stat
+    if [[ "$target_model" == "Gemini" && $M_HEALTH_G -eq 0 ]]; then
+      local cd_str
+      cd_str=$(fmt_time "$M_LEFT_G" compact)
+      echo -e "${C_RED}Error: profile '${best_name}' has no quota left for Gemini (cooldown: ${cd_str}).${C_RESET}" >&2
+      return 1
+    elif [[ "$target_model" == "Claude" && $M_HEALTH_C -eq 0 ]]; then
+      local cd_str
+      cd_str=$(fmt_time "$M_LEFT_C" compact)
+      echo -e "${C_RED}Error: profile '${best_name}' has no quota left for Claude (cooldown: ${cd_str}).${C_RESET}" >&2
+      return 1
+    elif (( M_HEALTH_G == 0 && M_HEALTH_C == 0 )); then
+      echo -e "${C_RED}Error: profile '${best_name}' has no available quota on any model.${C_RESET}" >&2
+      return 1
+    elif (( M_HEALTH_G == 0 )); then
+      local cd_str
+      cd_str=$(fmt_time "$M_LEFT_G" compact)
+      echo -e "${C_YELLOW}⚠ Notice: Gemini is out of quota on '${best_name}' (cooldown: ${cd_str}). Claude is available.${C_RESET}"
+    elif (( M_HEALTH_C == 0 )); then
+      local cd_str
+      cd_str=$(fmt_time "$M_LEFT_C" compact)
+      echo -e "${C_YELLOW}⚠ Notice: Claude is out of quota on '${best_name}' (cooldown: ${cd_str}). Gemini is available.${C_RESET}"
     fi
-    pick_AUTH "$target_model" "$preferred_profile" || return 1
+  else
+    local preferred_profile="" exclude_profile="$active_cli"
+    if [[ "$target_scope" == "cli" ]]; then
+      preferred_profile="$active_acp"
+      [[ "$preferred_profile" == "$active_cli" ]] && preferred_profile=""
+    elif [[ "$target_scope" == "acp" ]]; then
+      exclude_profile="$active_acp"
+      preferred_profile="$active_cli"
+      [[ "$preferred_profile" == "$active_acp" ]] && preferred_profile=""
+    fi
+    pick_AUTH "$target_model" "$preferred_profile" "$exclude_profile" || return 1
   fi
 
   local AUTH_file="${AUTH_DIR}/antigravity-oauth-token-${best_name}"
@@ -1254,7 +1310,7 @@ prepare_AUTH() {
     elif [[ "$target_model" == "Claude" ]]; then
       (( M_HEALTH_C == 1 )) && has_model=1
     else
-      (( M_HEALTH_G == 1 && M_HEALTH_C == 1 )) && has_model=1
+      (( M_HEALTH_G == 1 || M_HEALTH_C == 1 )) && has_model=1
     fi
   fi
 
@@ -1280,7 +1336,8 @@ prepare_AUTH() {
   sync_AUTHs
   local preferred_profile
   preferred_profile=$(find_active_acp_AUTH 2>/dev/null || true)
-  pick_AUTH "$target_model" "$preferred_profile" || return 1
+  [[ "$preferred_profile" == "$active_name" ]] && preferred_profile=""
+  pick_AUTH "$target_model" "$preferred_profile" "$active_name" || return 1
   
   if [[ "$best_name" == "$active_name" ]]; then
     echo -e "${C_RED}Error: all available profiles are currently out of quota.${C_RESET}" >&2
