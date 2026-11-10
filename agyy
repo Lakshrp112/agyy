@@ -381,7 +381,7 @@ reload_acp_daemons() {
     eval "$ACP_RELOAD_CMD" 2>/dev/null || true
   fi
 
-  # 2. Executable hook scripts in ~/.agy_toys/auth/hooks
+  # 2. Executable hook scripts in ~/.agyy/auth/hooks
   local hook_dir="$AUTH_DIR/hooks"
   if [[ -x "$hook_dir/on_acp_reload" ]]; then
     "$hook_dir/on_acp_reload" "$profile_name" "$TARGET_ACP_AUTH" 2>/dev/null || true
@@ -1213,15 +1213,17 @@ find_active_acp_AUTH() {
     target_ref=$(get_refresh_AUTH "$TARGET_ACP_AUTH") || target_ref=""
   fi
   if [[ -z "$target_ref" ]]; then
-    local t3_base="$T3_USERDATA_DIR/providers/antigravity"
-    if [[ -d "$t3_base" ]]; then
-      for t3_inst in "$t3_base"/*; do
+    local t3_bases=()
+    mapfile -t t3_bases < <(get_t3_bases)
+    for b in "${t3_bases[@]}"; do
+      [[ -d "$b" ]] || continue
+      for t3_inst in "$b"/*; do
         if [[ -f "$t3_inst/antigravity-acp/acp_token.json" ]]; then
           target_ref=$(get_refresh_AUTH "$t3_inst/antigravity-acp/acp_token.json" 2>/dev/null || true)
-          [[ -n "$target_ref" ]] && break
+          [[ -n "$target_ref" ]] && break 2
         fi
       done
-    fi
+    done
   fi
   [[ -n "$target_ref" ]] || return 1
   match_profile_by_ref "$target_ref"
@@ -1538,7 +1540,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 client_id = codecs.decode('1071006060591-gzuffva2u21yper235igbybwu4t403rc.nccf.tbbtyrhfrepbagrag.pbz', 'rot_13')
 client_secret = codecs.decode('TBPFCK-X58SJE486YqYW1zYO8fKP4m6dQNs', 'rot_13')
-auth_dir = os.environ.get('AUTH_DIR', os.path.expanduser('~/.agy_toys/auth'))
+auth_dir = os.environ.get('AUTH_DIR', os.path.expanduser('~/.agyy/auth'))
 usage_file = os.environ.get('USAGE_FILE', os.path.join(auth_dir, 'auth_usage.csv'))
 default_quota = os.environ.get('DEFAULT_QUOTA', '100')
 default_refresh = os.environ.get('REFRESH', '7d')
@@ -1842,12 +1844,14 @@ clean_cli() {
       local acp_dir
       acp_dir="$(dirname "$TARGET_ACP_AUTH")"
       rm -rf "$acp_dir"/conversations/* 2>/dev/null || true
-      local t3_base="$T3_USERDATA_DIR/providers/antigravity"
-      if [[ -d "$t3_base" ]]; then
-        for t3_inst in "$t3_base"/*; do
+      local t3_bases=()
+      mapfile -t t3_bases < <(get_t3_bases)
+      for b in "${t3_bases[@]}"; do
+        [[ -d "$b" ]] || continue
+        for t3_inst in "$b"/*; do
           rm -rf "$t3_inst/antigravity-acp/conversations"/* 2>/dev/null || true
         done
-      fi
+      done
       echo -e "${C_GREEN}✔ Cleared ACP conversations.${C_RESET}"
       ;;
     all)
@@ -1948,6 +1952,60 @@ cmd_continue() {
       fi
       ;;
   esac
+}
+
+cmd_update() {
+  local target_dir="${AGYY_HOME:-$HOME/.agyy}"
+  local current_script
+  current_script="$(realpath "${BASH_SOURCE[0]}")"
+  local current_dir
+  current_dir="$(cd "$(dirname "$current_script")" && pwd)"
+  local repo_dir="$target_dir"
+
+  if [[ -e "$current_dir/.git" ]]; then
+    repo_dir="$current_dir"
+  fi
+
+  echo -e "${C_BOLD}${C_CYAN}🔄 Updating agyy in ${C_WHITE}${repo_dir}${C_RESET}..."
+
+  if [[ -e "$repo_dir/.git" ]]; then
+    if ! command -v git >/dev/null 2>&1; then
+      echo -e "${C_RED}Error: git is not installed or not in PATH.${C_RESET}" >&2
+      return 1
+    fi
+    local ret=0 git_out=""
+    git_out=$(git -C "$repo_dir" pull --ff-only 2>&1) || ret=$?
+    if [[ $ret -ne 0 ]]; then
+      echo -e "${C_RED}Error: git pull failed in ${repo_dir}:${C_RESET}\n$git_out" >&2
+      return $ret
+    fi
+    chmod +x "$repo_dir/agyy" 2>/dev/null || true
+    if echo "$git_out" | grep -qi "Already up to date"; then
+      echo -e "${C_GREEN}✔ agyy is already up to date.${C_RESET}"
+    else
+      echo -e "${C_GREEN}✔ agyy updated successfully to latest version.${C_RESET}"
+      echo -e "${C_DIM}$git_out${C_RESET}"
+    fi
+  else
+    if ! command -v curl >/dev/null 2>&1; then
+      echo -e "${C_RED}Error: curl is required to update standalone agyy.${C_RESET}" >&2
+      return 1
+    fi
+    local tmp_file="$repo_dir/agyy.tmp.$$"
+    local raw_url="https://raw.githubusercontent.com/lakshrp112/agyy/main/agyy"
+    local raw_comp="https://raw.githubusercontent.com/lakshrp112/agyy/main/completion.bash"
+
+    if curl -fsSL "$raw_url" -o "$tmp_file" 2>/dev/null; then
+      chmod +x "$tmp_file"
+      mv -f "$tmp_file" "$repo_dir/agyy"
+      curl -fsSL "$raw_comp" -o "$repo_dir/completion.bash" 2>/dev/null || true
+      echo -e "${C_GREEN}✔ agyy updated successfully.${C_RESET}"
+    else
+      rm -f "$tmp_file"
+      echo -e "${C_RED}Error: failed to download latest version from GitHub.${C_RESET}" >&2
+      return 1
+    fi
+  fi
 }
 
 init_shell() {
@@ -2136,6 +2194,10 @@ case "${1:-}" in
     shift 2>/dev/null || true
     cmd_reload_acp
     ;;
+  update)
+    shift 2>/dev/null || true
+    cmd_update "$@"
+    ;;
   init)
     shift 2>/dev/null || true
     init_shell "$@"
@@ -2157,6 +2219,7 @@ case "${1:-}" in
     echo -e "  ${C_GREEN}clean${C_RESET} [chats|acp|all] [-f]     Clean CLI/ACP cache and session state"
     echo -e "  ${C_GREEN}reload-acp${C_RESET}                 Signal running ACP daemons to reload tokens"
     echo -e "  ${C_GREEN}sync-skills${C_RESET}                 Link ~/.agents/skills to CLI folder"
+    echo -e "  ${C_GREEN}update${C_RESET}                      Update agyy via git pull"
     echo -e "  ${C_GREEN}init${C_RESET}                        Configure PATH and completion in ~/.bashrc"
     echo -e "  ${C_GREEN}help${C_RESET}                        Show this help message\n"
     echo -e "${C_BOLD}Flags:${C_RESET}"
