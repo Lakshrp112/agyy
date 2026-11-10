@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-AUTH_DIR="${AUTH_DIR:-$HOME/.agy_toys/auth}"
+AUTH_DIR="${AUTH_DIR:-$HOME/.agyy/auth}"
 TARGET_AUTH="${TARGET_AUTH:-$HOME/.gemini/antigravity-cli/antigravity-oauth-token}"
 TARGET_ACP_AUTH="${TARGET_ACP_AUTH:-$HOME/.gemini/antigravity-acp/acp_token.json}"
 T3_USERDATA_DIR="${T3_USERDATA_DIR:-$HOME/.t3/userdata}"
@@ -41,6 +41,14 @@ else
   C_BRIGHT_GREEN=''
   C_BRIGHT_YELLOW=''
   C_BRIGHT_RED=''
+fi
+
+# Migrate legacy ~/.agy_toys to ~/.agyy if present
+if [[ -d "$HOME/.agy_toys" && ! -d "$HOME/.agyy" ]]; then
+  mv "$HOME/.agy_toys" "$HOME/.agyy" 2>/dev/null || true
+elif [[ -d "$HOME/.agy_toys/auth" && -d "$HOME/.agyy" && ! -d "$HOME/.agyy/auth" ]]; then
+  mkdir -p "$HOME/.agyy/auth"
+  cp -rn "$HOME/.agy_toys/auth"/* "$HOME/.agyy/auth/" 2>/dev/null || true
 fi
 
 mkdir -p "$AUTH_DIR"
@@ -1943,33 +1951,136 @@ cmd_continue() {
 }
 
 init_shell() {
+  local target_dir="${AGYY_HOME:-$HOME/.agyy}"
   local bashrc="$HOME/.bashrc"
-  local project_dir
-  project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  echo -e "${C_BOLD}${C_CYAN}⚙ Configuring shell integration in ${C_WHITE}${bashrc}${C_RESET}"
+  local current_script
+  current_script="$(realpath "${BASH_SOURCE[0]}")"
+  local current_dir
+  current_dir="$(cd "$(dirname "$current_script")" && pwd)"
+  local clean_source=1
 
-  if [[ ! -f "$bashrc" ]]; then
-    touch "$bashrc"
+  for arg in "$@"; do
+    case "$arg" in
+      --no-clean|--dev)
+        clean_source=0
+        ;;
+    esac
+  done
+
+  echo -e "${C_BOLD}${C_CYAN}⚙ Initializing agyy in ${C_WHITE}${target_dir}${C_RESET}"
+
+  # 1. Automatic migration from legacy ~/.agy_toys to ~/.agyy if present
+  if [[ -d "$HOME/.agy_toys" && ! -d "$target_dir" ]]; then
+    echo -e "${C_DIM}Migrating existing ~/.agy_toys to ${target_dir}...${C_RESET}"
+    mv "$HOME/.agy_toys" "$target_dir"
+  elif [[ -d "$HOME/.agy_toys/auth" && -d "$target_dir" ]]; then
+    mkdir -p "$target_dir/auth"
+    cp -rn "$HOME/.agy_toys/auth"/* "$target_dir/auth/" 2>/dev/null || true
   fi
 
-  # Clean up legacy wrapper function overrides if present
-  if grep -E "(agy|agyy)\(\)" "$bashrc" >/dev/null 2>&1; then
-    sed -i '/# agyy (Antigravity CLI Extension & Smart Wrapper)/,/^}/d' "$bashrc" 2>/dev/null || true
-    sed -i '/# agy-toys (Antigravity CLI Extension & Auth Utility)/,/^}/d' "$bashrc" 2>/dev/null || true
-  fi
+  # 2. If running outside target_dir, migrate/install files into target_dir
+  if [[ "$current_dir" != "$target_dir" ]]; then
+    if [[ ! -d "$target_dir" && "$current_dir" != "$HOME" && "$current_dir" != "/" ]]; then
+      echo -e "${C_DIM}Moving ${current_dir} to ${target_dir}...${C_RESET}"
+      mv "$current_dir" "$target_dir"
+      chmod +x "$target_dir/agyy" 2>/dev/null || true
+    else
+      mkdir -p "$target_dir"
+      echo -e "${C_DIM}Installing files to ${target_dir}...${C_RESET}"
+      cp -f "$current_script" "$target_dir/agyy"
+      chmod +x "$target_dir/agyy"
+      [[ -f "$current_dir/completion.bash" ]] && cp -f "$current_dir/completion.bash" "$target_dir/completion.bash"
+      [[ -f "$current_dir/README.md" ]] && cp -f "$current_dir/README.md" "$target_dir/README.md"
 
-  local added_any=0
-
-  if ! grep -q "PATH=.*${project_dir}" "$bashrc" 2>/dev/null; then
-    echo -e "${C_DIM}Adding ${project_dir} to PATH in ${bashrc}...${C_RESET}"
-    printf '\n# agyy (Antigravity CLI Extension & Smart Wrapper)\nexport PATH="%s:$PATH"\nsource "%s/completion.bash" 2>/dev/null || true\n' "$project_dir" "$project_dir" >> "$bashrc"
-    added_any=1
-  fi
-
-  if (( added_any == 1 )); then
-    echo -e "${C_GREEN}✔ Shell integration installed. Run: source ~/.bashrc${C_RESET}"
+      if (( clean_source == 1 )); then
+        if [[ "$current_dir" != "$HOME" && "$current_dir" != "/" && "$current_dir" != "$target_dir" ]]; then
+          local base_name
+          base_name="$(basename "$current_dir")"
+          if [[ "$base_name" == "agyy" || "$base_name" == "agy-toys" || "$base_name" == ".agy_toys" ]]; then
+            echo -e "${C_DIM}Cleaning up source directory ${current_dir}...${C_RESET}"
+            rm -rf "$current_dir"
+          else
+            echo -e "${C_DIM}Cleaning up source installer ${current_script}...${C_RESET}"
+            rm -f "$current_script"
+          fi
+        fi
+      else
+        echo -e "${C_DIM}Installed to ${target_dir} (source directory at ${current_dir} preserved).${C_RESET}"
+      fi
+    fi
   else
-    echo -e "${C_GREEN}✔ Shell integration is already configured in ${bashrc}.${C_RESET}"
+    chmod +x "$target_dir/agyy"
+  fi
+
+  # 3. Check ~/.bashrc intelligently
+  echo -e "${C_DIM}Checking shell integration in ${bashrc}...${C_RESET}"
+  [[ -f "$bashrc" ]] || touch "$bashrc"
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo -e "${C_RED}Error: python3 is required for shell integration.${C_RESET}" >&2
+    return 1
+  fi
+
+  local needs_update
+  needs_update=$(python3 - "$bashrc" "$target_dir" << 'PYEOF'
+import sys, re
+
+bashrc_path, target_dir = sys.argv[1], sys.argv[2]
+try:
+    with open(bashrc_path, 'r') as f:
+        content = f.read()
+
+    has_correct_path = bool(re.search(rf'export PATH=.*{re.escape(target_dir)}:\$PATH', content))
+    has_correct_comp = bool(re.search(rf'source .*{re.escape(target_dir)}/completion\.bash', content))
+    has_correct_sched = bool(re.search(r'scheduled-push\.sh', content))
+    has_stale_entries = bool(re.search(r'/\.agy_toys[:"]', content)) or bool(re.search(r'(?:agy|agyy)\(\)\s*\{', content))
+
+    if has_correct_path and has_correct_comp and has_correct_sched and not has_stale_entries:
+        print("ALREADY_CONFIGURED")
+    else:
+        print("NEEDS_UPDATE")
+except Exception:
+    print("NEEDS_UPDATE")
+PYEOF
+)
+
+  if [[ "$needs_update" == "ALREADY_CONFIGURED" ]]; then
+    echo -e "${C_GREEN}✔ Shell integration is already correctly configured in ${bashrc}.${C_RESET}"
+  else
+    python3 - "$bashrc" "$target_dir" << 'PYEOF'
+import sys, re
+
+bashrc_path, target_dir = sys.argv[1], sys.argv[2]
+try:
+    with open(bashrc_path, 'r') as f:
+        content = f.read()
+
+    lines = []
+    for line in content.splitlines():
+        if line.strip().startswith("# agyy") or line.strip().startswith("# agy-toys"):
+            continue
+        if re.search(r'export PATH=.*(?:/\.agy_toys|/agyy):\$PATH', line):
+            continue
+        if re.search(r'source .*?(?:/\.agy_toys|/agyy)/completion\.bash', line):
+            continue
+        if 'scheduled-push.sh' in line:
+            continue
+        lines.append(line)
+
+    cleaned = "\n".join(lines).rstrip()
+    cleaned = re.sub(r'(?:\n*# (?:agyy|agy-toys) \(.*?\)\n+)?(?:agy|agyy)\(\)\s*\{[\s\S]*?\n\}\n*', '', cleaned)
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+
+    block = f'\n\n# agyy (Antigravity CLI Extension & Smart Wrapper)\nexport PATH="{target_dir}:$PATH"\nsource "{target_dir}/completion.bash" 2>/dev/null || true\n( [[ -x "{target_dir}/scripts/scheduled-push.sh" ]] && "{target_dir}/scripts/scheduled-push.sh" >/dev/null 2>&1 & )\n'
+    new_content = cleaned + block
+
+    with open(bashrc_path, 'w') as f:
+        f.write(new_content)
+except Exception as e:
+    sys.stderr.write(f"Error configuring bashrc: {e}\n")
+    sys.exit(1)
+PYEOF
+    echo -e "${C_GREEN}✔ Shell integration installed in ${bashrc}. Run: source ~/.bashrc${C_RESET}"
   fi
 }
 
@@ -2026,7 +2137,8 @@ case "${1:-}" in
     cmd_reload_acp
     ;;
   init)
-    init_shell
+    shift 2>/dev/null || true
+    init_shell "$@"
     ;;
   help|-h|--help)
     echo -e "${C_BOLD}${C_CYAN}agyy — multi-account quota manager for agy${C_RESET}"

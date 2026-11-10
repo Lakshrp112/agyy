@@ -21,8 +21,8 @@ When one account hits rate limits on Gemini or Claude, `agyy` swaps to one that 
 ## Installation
 
 ```bash
-git clone https://github.com/Lakshrp112/agyy ~/.agy_toys
-cd ~/.agy_toys
+git clone https://github.com/Lakshrp112/agyy ~/.agyy
+cd ~/.agyy
 ./agyy init
 ```
 
@@ -85,6 +85,7 @@ agyy continue true
 | `agyy clean` | `[chats\|acp\|all] [-f]` | Clear conversation history, logs, or ACP caches |
 | `agyy reload-acp` | — | Send reload signal (SIGHUP) to running ACP processes |
 | `agyy sync-skills` | — | Symlink `~/.agents/skills` to CLI skills directory |
+| `agyy update` | — | Update agyy to latest version via git pull |
 | `agyy init` | — | Add PATH and bash completion to `~/.bashrc` |
 | `agyy help` | — | Show usage summary |
 
@@ -113,13 +114,13 @@ $ agyy status
 
 ## Configuration & Hooks
 
-- `AUTH_DIR` (default: `~/.agy_toys/auth`): Directory storing saved token profiles and cache.
+- `AUTH_DIR` (default: `~/.agyy/auth`): Directory storing saved token profiles and cache.
 - `TARGET_AUTH` (default: `~/.gemini/antigravity-cli/antigravity-oauth-token`): Active CLI token file.
 - `TARGET_ACP_AUTH` (default: `~/.gemini/antigravity-acp/acp_token.json`): Active ACP token file.
 - `T3_USERDATA_DIR` (default: `~/.t3/userdata`): Base userdata folder for editor ACP instances.
 - `ACP_RELOAD_CMD`: Optional shell command to run on profile swap (e.g. reload an editor workspace).
 - `ACP_RELOAD_SIGNAL` (default: `HUP`): Signal sent to running ACP daemon processes when swapping.
-- **Lifecycle hooks:** Executables placed in `~/.agy_toys/auth/hooks/on_swap` or `~/.agy_toys/auth/hooks/on_acp_reload` run automatically whenever profiles change.
+- **Lifecycle hooks:** Executables placed in `~/.agyy/auth/hooks/on_swap` or `~/.agyy/auth/hooks/on_acp_reload` run automatically whenever profiles change.
 
 ---
 

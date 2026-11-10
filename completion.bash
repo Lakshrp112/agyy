@@ -1,5 +1,5 @@
 _agy_get_auth_profiles() {
-    local auth_dir="${AUTH_DIR:-$HOME/.agy_toys/auth}"
+    local auth_dir="${AUTH_DIR:-$HOME/.agyy/auth}"
     if [[ -d "$auth_dir" ]]; then
         shopt -s nullglob
         for f in "$auth_dir"/antigravity-oauth-token-*; do
@@ -21,12 +21,13 @@ _agy_extension_completion() {
         cword=$COMP_CWORD
     fi
 
-    local toys_cmds="status swap save delete whoami sync yolo continue clean reload-acp reload sync-skills init help"
+    local agyy_cmds="status swap save delete whoami sync yolo continue clean reload-acp reload sync-skills update init help"
     local agy_flags="-y --yolo -c --continue -m --model -p --print -h --help"
     local models="Gemini Claude"
     local clean_opts="chats conversations permissions acp all -f"
     local yolo_opts="true false status"
     local continue_opts="true false status"
+    local init_opts="--dev --no-clean"
 
     case "$prev" in
         --model|-m)
@@ -45,6 +46,10 @@ _agy_extension_completion() {
             COMPREPLY=( $(compgen -W "${continue_opts}" -- "$cur") )
             return 0
             ;;
+        init)
+            COMPREPLY=( $(compgen -W "${init_opts}" -- "$cur") )
+            return 0
+            ;;
     esac
 
     local subcmd=""
@@ -53,7 +58,7 @@ _agy_extension_completion() {
     for (( i=1; i < cword; i++ )); do
         local w="${words[i]}"
         if [[ "$w" != -* ]]; then
-            for cmd in $toys_cmds; do
+            for cmd in $agyy_cmds; do
                 if [[ "$w" == "$cmd" ]]; then
                     subcmd="$w"
                     subcmd_idx=$i
@@ -118,7 +123,7 @@ _agy_extension_completion() {
     fi
 
     if [[ -z "$subcmd" ]]; then
-        COMPREPLY=( $(compgen -W "${toys_cmds} ${agy_flags}" -- "$cur") )
+        COMPREPLY=( $(compgen -W "${agyy_cmds} ${agy_flags}" -- "$cur") )
         return 0
     fi
 }
