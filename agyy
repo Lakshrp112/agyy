@@ -122,7 +122,7 @@ get_token_field() {
   local f="$1" key="$2"
   [[ -f "$f" ]] || return 1
   if command -v jq >/dev/null 2>&1; then
-    jq -r ".token.${key} // .${key} // (if .token and (\"${key}\" == \"access_token\" or \"${key}\" == \"token\") and (.token | type == \"string\") then .token else empty end) // empty" "$f" 2>/dev/null
+    jq -r "try (.token.${key}) // (if (try (.token | type)) == \"string\" and (\"${key}\" == \"access_token\" or \"${key}\" == \"token\") then .token else empty end) // .${key} // empty" "$f" 2>/dev/null
   else
     sed -n -E "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"([^\"]*)\".*/\\1/p" "$f" | head -n1
   fi
@@ -200,6 +200,9 @@ if src_or_acc:
             if isinstance(tok_obj, dict):
                 acc_token = tok_obj.get('access_token')
                 expiry = tok_obj.get('expiry')
+            elif isinstance(tok_obj, str):
+                acc_token = tok_obj
+                expiry = src_data.get('expiry')
             else:
                 acc_token = src_data.get('access_token')
                 expiry = src_data.get('expiry')
@@ -244,6 +247,9 @@ if not acc_token or not is_valid_expiry(expiry):
                         if isinstance(sf_data.get('token'), dict):
                             sf_data['token']['access_token'] = new_at
                             sf_data['token']['expiry'] = expiry
+                        elif isinstance(sf_data.get('token'), str):
+                            sf_data['token'] = new_at
+                            sf_data['expiry'] = expiry
                         else:
                             sf_data['access_token'] = new_at
                             sf_data['expiry'] = expiry
@@ -280,9 +286,27 @@ PYEOF
   sync_t3_profiles
 }
 
+get_t3_bases() {
+  local bases=("$T3_USERDATA_DIR/providers/antigravity")
+  local win_user="${USER:-}"
+  if [[ -n "$win_user" && -d "/mnt/c/Users/$win_user/.t3/userdata/providers/antigravity" ]]; then
+    bases+=("/mnt/c/Users/$win_user/.t3/userdata/providers/antigravity")
+  fi
+  for udir in /mnt/c/Users/*/.t3/userdata/providers/antigravity; do
+    if [[ -d "$udir" ]]; then
+      local already=0
+      for b in "${bases[@]}"; do
+        [[ "$b" == "$udir" ]] && { already=1; break; }
+      done
+      (( already == 0 )) && bases+=("$udir")
+    fi
+  done
+  printf "%s\n" "${bases[@]}"
+}
+
 sync_t3_profiles() {
-  local t3_base="$T3_USERDATA_DIR/providers/antigravity"
-  [[ -d "$t3_base" ]] || return 0
+  local t3_bases=()
+  mapfile -t t3_bases < <(get_t3_bases)
 
   # Forward sync: if TARGET_ACP_AUTH exists and has a token, sync to all T3Code instances
   if [[ -f "$TARGET_ACP_AUTH" ]]; then
@@ -296,42 +320,48 @@ sync_t3_profiles() {
         _IN_SYNC_T3=1 write_acp_token "$target_token" 2>/dev/null || true
       fi
 
-      for t3_inst in "$t3_base"/*; do
-        if [[ -d "$t3_inst" ]]; then
-          local t3_acp_dir="$t3_inst/antigravity-acp"
-          mkdir -p "$t3_acp_dir"
-          local t3_token="$t3_acp_dir/acp_token.json"
-          if [[ ! -f "$t3_token" ]] || ! cmp -s "$TARGET_ACP_AUTH" "$t3_token"; then
-            local tmp_t3="$t3_acp_dir/.acp_token.tmp.$$"
-            cp -f "$TARGET_ACP_AUTH" "$tmp_t3" 2>/dev/null && \
-              chmod 600 "$tmp_t3" 2>/dev/null && \
-              mv -f "$tmp_t3" "$t3_token" 2>/dev/null || true
+      for b in "${t3_bases[@]}"; do
+        [[ -d "$b" ]] || continue
+        for t3_inst in "$b"/*; do
+          if [[ -d "$t3_inst" ]]; then
+            local t3_acp_dir="$t3_inst/antigravity-acp"
+            mkdir -p "$t3_acp_dir"
+            local t3_token="$t3_acp_dir/acp_token.json"
+            if [[ ! -f "$t3_token" ]] || ! cmp -s "$TARGET_ACP_AUTH" "$t3_token"; then
+              local tmp_t3="$t3_acp_dir/.acp_token.tmp.$$"
+              cp -f "$TARGET_ACP_AUTH" "$tmp_t3" 2>/dev/null && \
+                chmod 600 "$tmp_t3" 2>/dev/null && \
+                mv -f "$tmp_t3" "$t3_token" 2>/dev/null || true
+            fi
           fi
-        fi
+        done
       done
       return 0
     fi
   fi
 
   # Reverse sync: if TARGET_ACP_AUTH is missing or empty, see if any T3Code instance has a valid token
-  for t3_inst in "$t3_base"/*; do
-    if [[ -d "$t3_inst" ]]; then
-      local t3_token="$t3_inst/antigravity-acp/acp_token.json"
-      if [[ -f "$t3_token" ]]; then
-        local t3_ref
-        t3_ref=$(get_refresh_AUTH "$t3_token" 2>/dev/null || true)
-        if [[ -n "$t3_ref" ]]; then
-          local target_dir
-          target_dir="$(dirname "$TARGET_ACP_AUTH")"
-          mkdir -p "$target_dir"
-          local tmp_main="$target_dir/.acp_token.tmp.$$"
-          cp -f "$t3_token" "$tmp_main" 2>/dev/null && \
-            chmod 600 "$tmp_main" 2>/dev/null && \
-            mv -f "$tmp_main" "$TARGET_ACP_AUTH" 2>/dev/null || true
-          break
+  for b in "${t3_bases[@]}"; do
+    [[ -d "$b" ]] || continue
+    for t3_inst in "$b"/*; do
+      if [[ -d "$t3_inst" ]]; then
+        local t3_token="$t3_inst/antigravity-acp/acp_token.json"
+        if [[ -f "$t3_token" ]]; then
+          local t3_ref
+          t3_ref=$(get_refresh_AUTH "$t3_token" 2>/dev/null || true)
+          if [[ -n "$t3_ref" ]]; then
+            local target_dir
+            target_dir="$(dirname "$TARGET_ACP_AUTH")"
+            mkdir -p "$target_dir"
+            local tmp_main="$target_dir/.acp_token.tmp.$$"
+            cp -f "$t3_token" "$tmp_main" 2>/dev/null && \
+              chmod 600 "$tmp_main" 2>/dev/null && \
+              mv -f "$tmp_main" "$TARGET_ACP_AUTH" 2>/dev/null || true
+            break 2
+          fi
         fi
       fi
-    fi
+    done
   done
 }
 
@@ -1524,9 +1554,13 @@ def fetch_single_auth(fpath):
     except Exception:
         return name, None
 
-    token_obj = data.get('token', {})
-    access_token = token_obj.get('access_token') or data.get('access_token')
-    refresh_token = token_obj.get('refresh_token') or data.get('refresh_token')
+    token_obj = data.get('token')
+    if isinstance(token_obj, dict):
+        access_token = token_obj.get('access_token') or data.get('access_token')
+        refresh_token = token_obj.get('refresh_token') or data.get('refresh_token')
+    else:
+        access_token = data.get('access_token') or (token_obj if isinstance(token_obj, str) else None)
+        refresh_token = data.get('refresh_token')
 
     project_id = data.get('project_id') or 'aicode-consumers'
     def call_api(at):
