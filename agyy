@@ -2090,10 +2090,10 @@ try:
 
     has_correct_path = bool(re.search(rf'export PATH=.*{re.escape(target_dir)}:\$PATH', content))
     has_correct_comp = bool(re.search(rf'source .*{re.escape(target_dir)}/completion\.bash', content))
-    has_correct_sched = bool(re.search(r'scheduled-push\.sh', content))
-    has_stale_entries = bool(re.search(r'/\.agy_toys[:"]', content)) or bool(re.search(r'(?:agy|agyy)\(\)\s*\{', content))
+    has_duplicate = len(re.findall(r'export PATH=.*(?:/\.agy_toys|/\.?agyy):\$PATH', content)) > 1
+    has_stale_entries = bool(re.search(r'/\.agy_toys[:"]', content)) or bool(re.search(r'(?:agy|agyy)\(\)\s*\{', content)) or bool(re.search(r'scheduled-push\.sh', content)) or has_duplicate
 
-    if has_correct_path and has_correct_comp and has_correct_sched and not has_stale_entries:
+    if has_correct_path and has_correct_comp and not has_stale_entries:
         print("ALREADY_CONFIGURED")
     else:
         print("NEEDS_UPDATE")
@@ -2117,9 +2117,9 @@ try:
     for line in content.splitlines():
         if line.strip().startswith("# agyy") or line.strip().startswith("# agy-toys"):
             continue
-        if re.search(r'export PATH=.*(?:/\.agy_toys|/agyy):\$PATH', line):
+        if re.search(r'export PATH=.*(?:/\.agy_toys|/\.?agyy):\$PATH', line):
             continue
-        if re.search(r'source .*?(?:/\.agy_toys|/agyy)/completion\.bash', line):
+        if re.search(r'source .*?(?:/\.agy_toys|/\.?agyy)/completion\.bash', line):
             continue
         if 'scheduled-push.sh' in line:
             continue
@@ -2129,7 +2129,7 @@ try:
     cleaned = re.sub(r'(?:\n*# (?:agyy|agy-toys) \(.*?\)\n+)?(?:agy|agyy)\(\)\s*\{[\s\S]*?\n\}\n*', '', cleaned)
     cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
 
-    block = f'\n\n# agyy (Antigravity CLI Extension & Smart Wrapper)\nexport PATH="{target_dir}:$PATH"\nsource "{target_dir}/completion.bash" 2>/dev/null || true\n( [[ -x "{target_dir}/scripts/scheduled-push.sh" ]] && "{target_dir}/scripts/scheduled-push.sh" >/dev/null 2>&1 & )\n'
+    block = f'\n\n# agyy (Antigravity CLI Extension & Smart Wrapper)\nexport PATH="{target_dir}:$PATH"\nsource "{target_dir}/completion.bash" 2>/dev/null || true\n'
     new_content = cleaned + block
 
     with open(bashrc_path, 'w') as f:
